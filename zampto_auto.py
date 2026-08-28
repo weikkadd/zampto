@@ -264,16 +264,15 @@ def click_btn(page, selector):
 
 
 def solve_turnstile(page, max_wait=30):
-    """检测并尝试自动通过 Cloudflare Turnstile 验证。
-    返回 True 表示验证已通过/无需验证, False 表示失败或超时。
+    """等待 Cloudflare Turnstile 验证自动通过。
 
-    采用真实浏览器行为模拟: 随机鼠标轨迹 + 拟人化延迟, 降低被 CF 检测为自动化的概率。
+    用户确认: 点击 Renew 后 Turnstile 会自动通过 (无需点击 checkbox)。
+    本函数只做检测和等待, 不主动点击 (避免干扰自动验证)。
+    返回 True 表示验证已通过/无需验证, False 表示超时。
     """
     import time as _time
-    import random as _random
-    log.info("🎯 检查 Turnstile 验证...")
+    log.info("🎯 等待 Turnstile 自动验证通过...")
     deadline = _time.time() + max_wait
-    click_count = 0
     while _time.time() < deadline:
         try:
             # 1. 检查页面是否出现验证提示
@@ -285,7 +284,7 @@ def solve_turnstile(page, max_wait=30):
             has_verify = any(w in body_text.lower() for w in
                              ["security verification", "complete the security", "verification required",
                               "loading security", "please complete"])
-            # 2. 查找 Turnstile iframe (challenges.cloudflare.com)
+            # 2. 查找 Turnstile iframe
             has_frame = False
             try:
                 frames = page.frames
@@ -293,100 +292,19 @@ def solve_turnstile(page, max_wait=30):
                     furl = (fr.url or "").lower()
                     if "challenges.cloudflare.com" in furl or "turnstile" in furl:
                         has_frame = True
-                        log.info("  ✓ 发现 Turnstile iframe: %s", fr.url[:80])
                         break
             except Exception:
                 pass
 
             if not has_verify and not has_frame:
-                # 无验证, 直接通过
+                log.info("  ✅ 验证已消失, Turnstile 自动通过")
                 return True
 
-            # 3. 获取 iframe 位置
-            box = None
-            try:
-                box = page.evaluate("""
-                (() => {
-                    const ifr = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
-                    if (!ifr) return null;
-                    const r = ifr.getBoundingClientRect();
-                    return {x: r.x + window.scrollX, y: r.y + window.scrollY, w: r.width, h: r.height};
-                })()
-                """)
-            except Exception:
-                pass
-
-            if box and box.get("w"):
-                # Turnstile checkbox 在 iframe 左侧中间
-                target_x = box["x"] + min(35, box["w"] * 0.15) + _random.uniform(-3, 3)
-                target_y = box["y"] + box["h"] * 0.5 + _random.uniform(-3, 3)
-                # 拟人化: 从随机起点分 2-3 段移动过去, 每段有随机停顿
-                start_x = _random.uniform(200, 600)
-                start_y = _random.uniform(100, 500)
-                try:
-                    page.mouse.move(start_x, start_y)
-                    _time.sleep(_random.uniform(0.2, 0.6))
-                except Exception:
-                    pass
-                steps = _random.randint(2, 4)
-                for i in range(1, steps + 1):
-                    ix = start_x + (target_x - start_x) * i / steps + _random.uniform(-15, 15)
-                    iy = start_y + (target_y - start_y) * i / steps + _random.uniform(-15, 15)
-                    try:
-                        page.mouse.move(ix, iy)
-                    except Exception:
-                        pass
-                    _time.sleep(_random.uniform(0.15, 0.4))
-                _time.sleep(_random.uniform(0.1, 0.3))
-                log.info("  🖱️ 拟人化点击 Turnstile checkbox (%d, %d)",
-                         int(target_x), int(target_y))
-                try:
-                    page.mouse.click(target_x, target_y)
-                    click_count += 1
-                except Exception as e:
-                    log.warning("  坐标点击失败: %s", e)
-            else:
-                # 兜底: Playwright iframe 内尝试
-                try:
-                    for fr in page.frames:
-                        furl = (fr.url or "").lower()
-                        if "challenges.cloudflare.com" in furl or "turnstile" in furl:
-                            try:
-                                cb = fr.query_selector('input[type="checkbox"], [role="checkbox"], .ctp-checkbox-label')
-                                if cb:
-                                    cb.click(force=True)
-                                    click_count += 1
-                                    log.info("  ✓ Playwright 点击 Turnstile checkbox")
-                                    break
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
-            _time.sleep(4)
-            # 验证是否通过: 验证文字消失 + iframe 消失
-            try:
-                body_text2 = page.evaluate("document.body ? document.body.innerText : ''") or ""
-                frames2 = []
-                try:
-                    frames2 = page.frames
-                except Exception:
-                    pass
-                frame_gone = all(("challenges.cloudflare.com" not in (f.url or "").lower() and
-                                  "turnstile" not in (f.url or "").lower())
-                                 for f in frames2)
-                if (not any(w in body_text2.lower() for w in
-                            ["security verification", "complete the security", "verification required",
-                             "loading security"]) and frame_gone):
-                    log.info("  ✅ Turnstile 验证通过")
-                    return True
-            except Exception:
-                pass
-            _time.sleep(2)
+            _time.sleep(3)
         except Exception as e:
-            log.warning("Turnstile 处理异常: %s", e)
+            log.warning("Turnstile 等待异常: %s", e)
             _time.sleep(2)
-    log.warning("⏰ Turnstile 验证超时(%ds, 点击%d次)", max_wait, click_count)
+    log.warning("⏰ Turnstile 自动验证超时(%ds)", max_wait)
     return False
 
 
