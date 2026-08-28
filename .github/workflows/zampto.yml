@@ -51,49 +51,105 @@ jobs:
           pip install -r requirements.txt
           python -c "from cloakbrowser import ensure_binary; ensure_binary()"
 
-      - name: 🌐 启动 TUIC 代理
+      - name: "🌐 启动代理 (多格式: hysteria2/hy2/tuic/vless/vmess)"
         env:
           TUIC_URI: ${{ secrets.TUIC_URI }}
+          PROXY_URI: ${{ secrets.PROXY_URI }}
         run: |
           set -e
-          if [ -z "$TUIC_URI" ]; then
-            echo "[ERROR] TUIC_URI 未配置! GitHub 裸 IP 会被 Cloudflare 风控(403), 续期必失败"
-            echo "请到 Settings -> Secrets 添加 TUIC_URI (tuic:// 节点链接)"
+
+          # 兼容两个 secret 名: PROXY_URI 优先, TUIC_URI 兜底
+          NODE_LINK="${PROXY_URI:-$TUIC_URI}"
+          export NODE_LINK
+          if [ -z "$NODE_LINK" ]; then
+            echo "[ERROR] 代理节点未配置! GitHub 裸 IP 会被 Cloudflare 风控(403), 续期必失败"
+            echo "请到 Settings -> Secrets 添加 PROXY_URI (或兼容的 TUIC_URI), 支持格式:"
+            echo "  hysteria2://password@host:port?sni=...&insecure=1"
+            echo "  hy2://password@host:port?..."
+            echo "  tuic://uuid:password@host:port?..."
+            echo "  vless://uuid@host:port?..."
             exit 1
           fi
 
-          echo "[1/4] Parsing TUIC URI ..."
-          # Save URI to file to avoid env quoting issues
-          printf '%s' "$TUIC_URI" > /tmp/tuic_uri.txt
-          # Strip prefix (v2rayntuic:// or tuic://)
-          URI_BODY=$(sed -E 's|^[a-z]+://||' /tmp/tuic_uri.txt)
-          # Split userinfo@host?query
-          USERINFO_HOST=$(echo "$URI_BODY" | cut -d'?' -f1)
-          QUERY=$(echo "$URI_BODY" | cut -d'?' -f2-)
-          USERINFO=$(echo "$USERINFO_HOST" | cut -d'@' -f1)
-          HOSTPORT=$(echo "$USERINFO_HOST" | cut -d'@' -f2-)
-          # URL-decode userinfo (UUID:password might be %-encoded)
-          USERINFO_DECODED=$(printf '%b' "$(echo "$USERINFO" | sed 's/%/\\x/g')")
-          UUID=$(echo "$USERINFO_DECODED" | cut -d':' -f1)
-          PASSWORD=$(echo "$USERINFO_DECODED" | cut -d':' -f2-)
-          SERVER=$(echo "$HOSTPORT" | cut -d':' -f1)
-          PORT=$(echo "$HOSTPORT" | cut -d':' -f2-)
-          # Parse query params
-          SNI=$(echo "$QUERY" | tr '&' '\n' | grep -E '^sni=' | cut -d'=' -f2- | head -1)
-          INSECURE=$(echo "$QUERY" | tr '&' '\n' | grep -E '^insecure=' | cut -d'=' -f2- | head -1)
-          ALPN=$(echo "$QUERY" | tr '&' '\n' | grep -E '^alpn=' | cut -d'=' -f2- | head -1)
-          [ -z "$SNI" ] && SNI="$SERVER"
-          [ -z "$INSECURE" ] && INSECURE=0
-          [ -z "$ALPN" ] && ALPN="h3"
+          echo "[1/4] 解析节点链接并生成 sing-box 配置 ..."
+          python3 << 'PYEOF'
+          import urllib.parse, json, os, sys, base64
 
-          echo "  Server: $SERVER:$PORT"
-          echo "  UUID:   $UUID"
-          echo "  SNI:    $SNI"
-          echo "  Insecure: $INSECURE"
-          echo "  ALPN:   $ALPN"
+          link = os.environ.get("NODE_LINK", "").strip()
+          if not link:
+              sys.exit(1)
 
-          echo "[2/4] Downloading sing-box (supports TUIC v5 client) ..."
-          # Use sing-box - widely used, stable, supports TUIC v5 inbound+outbound
+          proto = "hysteria2"
+          for prefix in ["hysteria2://", "hy2://", "tuic://", "vless://", "vmess://"]:
+              if link.startswith(prefix):
+                  link = link[len(prefix):]
+                  proto = {"tuic://": "tuic", "vless://": "vless", "vmess://": "vmess"}.get(prefix, "hysteria2")
+                  break
+          link = link.split("#", 1)[0]
+          if "?" in link:
+              main, query = link.split("?", 1)
+          else:
+              main, query = link, ""
+          params = urllib.parse.parse_qs(query)
+          sni = params.get("sni", [""])[0]
+          insecure = any(params.get(k, ["0"])[0] in ("1", "true", "yes")
+                         for k in ("insecure", "allowInsecure", "allow_insecure"))
+          alpn = params.get("alpn", [""])[0]
+
+          out = {"type": proto, "tag": "proxy-out"}
+          if proto == "vmess":
+              b64 = main + "=" * ((4 - len(main) % 4) % 4)
+              vm = json.loads(base64.b64decode(b64).decode("utf-8", "ignore"))
+              out["server"] = vm.get("add", "")
+              out["server_port"] = int(vm.get("port", 0))
+              out["uuid"] = vm.get("id", "")
+              out["alter_id"] = int(vm.get("aid", "0"))
+              out["security"] = vm.get("scy", "auto") or "auto"
+              out["tls"] = {"enabled": False, "server_name": sni or vm.get("host", ""), "insecure": insecure}
+              if vm.get("tls") == "tls" or vm.get("sni") or vm.get("host"):
+                  out["tls"]["enabled"] = True
+                  out["tls"]["server_name"] = sni or vm.get("sni") or vm.get("host") or out["server"]
+          else:
+              password_raw, server_part = main.rsplit("@", 1)
+              password = urllib.parse.unquote(password_raw)
+              server, port_str = server_part.rsplit(":", 1)
+              out["server"] = server
+              out["server_port"] = int(port_str)
+              if proto == "tuic" or proto == "vless":
+                  # userinfo = uuid 或 uuid:password
+                  if ":" in password:
+                      out["uuid"], out["password"] = password.split(":", 1)
+                  else:
+                      out["uuid"] = password
+              else:  # hysteria2 / hy2
+                  out["password"] = password
+              out["tls"] = {"enabled": True, "server_name": sni or server, "insecure": insecure}
+              if alpn:
+                  out["tls"]["alpn"] = [alpn]
+              if proto == "tuic":
+                  out["udp_relay_mode"] = "native"
+                  out["congestion_control"] = "bbr"
+              elif proto == "hysteria2":
+                  out["up_mbps"] = 100
+                  out["down_mbps"] = 100
+
+          cfg = {
+              "log": {"level": "info", "timestamp": True},
+              "inbounds": [{"type": "socks", "tag": "socks-in",
+                            "listen": "127.0.0.1", "listen_port": 1080}],
+              "outbounds": [out],
+          }
+          with open("/tmp/sb_config.json", "w", encoding="utf-8") as f:
+              json.dump(cfg, f, indent=2, ensure_ascii=False)
+          print("Protocol:", proto)
+          print("Server:", out.get("server", "?"), ":", out.get("server_port", "?"))
+          print("SNI:", out.get("tls", {}).get("server_name", ""))
+          print("Insecure:", insecure)
+          PYEOF
+          echo "--- 生成的配置 ---"
+          cat /tmp/sb_config.json
+
+          echo "[2/4] Downloading sing-box ..."
           SB_VERSION="1.10.7"
           SB_URL="https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/sing-box-${SB_VERSION}-linux-amd64.tar.gz"
           echo "  URL: $SB_URL"
@@ -111,48 +167,14 @@ jobs:
           fi
           /tmp/sing-box version
 
-          echo "[3/4] Writing sing-box config ..."
-          cat > /tmp/sb_config.json <<EOF
-          {
-            "log": { "level": "info", "timestamp": true },
-            "inbounds": [
-              {
-                "type": "socks",
-                "tag": "socks-in",
-                "listen": "127.0.0.1",
-                "listen_port": 1080
-              }
-            ],
-            "outbounds": [
-              {
-                "type": "tuic",
-                "tag": "tuic-out",
-                "server": "$SERVER",
-                "server_port": $PORT,
-                "uuid": "$UUID",
-                "password": "$PASSWORD",
-                "tls": {
-                  "enabled": true,
-                  "server_name": "$SNI",
-                  "alpn": ["$ALPN"],
-                  "insecure": $([ "$INSECURE" = "1" ] && echo true || echo false)
-                },
-                "udp_relay_mode": "native",
-                "congestion_control": "bbr"
-              }
-            ]
-          }
-          EOF
-          cat /tmp/sb_config.json
-
           # Validate config before running
           echo "--- Validating config ---"
-          /tmp/sing-box check -c /tmp/sb_config.json || { echo "[ERROR] sing-box config validation failed"; exit 1; }
+          /tmp/sing-box check -c /tmp/sb_config.json || { echo "[ERROR] sing-box config validation failed"; cat /tmp/sb_config.json; exit 1; }
 
-          echo "[4/4] Starting sing-box ..."
+          echo "[3/4] Starting sing-box ..."
           nohup /tmp/sing-box run -c /tmp/sb_config.json > /tmp/tuic.log 2>&1 &
-          TUIC_PID=$!
-          echo "TUIC_PID=$TUIC_PID"
+          SB_PID=$!
+          echo "SB_PID=$SB_PID"
           sleep 8
 
           echo "--- sing-box log ---"
@@ -168,9 +190,9 @@ jobs:
             echo "ALL_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
             echo "HTTP_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
             echo "HTTPS_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
-            echo "[OK] TUIC proxy is ready"
+            echo "[OK] Proxy is ready"
           else
-            echo "[ERROR] TUIC proxy is DOWN - cannot renew (GitHub IP blocked by Cloudflare)"
+            echo "[ERROR] Proxy is DOWN - cannot renew (GitHub IP blocked by Cloudflare)"
             echo "---- sing-box log ----"
             cat /tmp/tuic.log 2>/dev/null | tail -30 || echo "no log"
             echo "----------------------"
