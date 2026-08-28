@@ -36,6 +36,8 @@ SERVER_ID = os.getenv("ZAMPTO_SERVER_ID", "")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 FORCE_RENEW = os.getenv("FORCE_RENEW", "false").lower() == "true"
+# 续期阈值 (小时): 剩余时间低于此值才续期, 与续期 API 判断保持一致
+RENEW_THRESHOLD_HOURS = int(os.getenv("RENEW_THRESHOLD_HOURS", "48"))
 DASHBOARD_URL = "https://dash.zampto.net"
 SESSION_FILE = "./screenshots/session.json"
 LOG_DIR = "./screenshots"
@@ -424,9 +426,11 @@ def phase_browser_renewal(cookies=None):
                         dt_ob = dt_cls.fromisoformat(exp_raw.replace("Z", "+00:00"))
                         expires_at = dt_ob + timedelta(hours=48)
                         rem_h = (expires_at - datetime.now(timezone.utc)).total_seconds() / 3600
-                        if rem_h > 42:
-                            log.info("剩余 %.0fh (>42h), 跳过续期", rem_h)
+                        if not FORCE_RENEW and rem_h > RENEW_THRESHOLD_HOURS:
+                            log.info("剩余 %.0fh (>%dh), 跳过续期", rem_h, RENEW_THRESHOLD_HOURS)
                             return "skipped"
+                        if FORCE_RENEW:
+                            log.info("剩余 %.0fh, FORCE_RENEW=true 强制续期", rem_h)
     except Exception as e:
         log.warning("预检查剩余时间失败(可能被CF拦截): %s", e)
     log.info("续期前 renewal: %r", baseline_renewal)
@@ -788,9 +792,9 @@ def phase_api_renewal(use_cookies=None):
                     total_h = days * 24 + hours
                     log.info("Expiry (string): %s = %d days %d h = %d h total", expiry_val, days, hours, total_h)
 
-                should_renew = FORCE_RENEW or total_h < 48
+                should_renew = FORCE_RENEW or total_h < RENEW_THRESHOLD_HOURS
                 if should_renew:
-                    log.info("Renewing server (%d h left, threshold: 48h)", total_h)
+                    log.info("Renewing server (%d h left, threshold: %dh)", total_h, RENEW_THRESHOLD_HOURS)
                     renewed = False
                     # Confirmed correct endpoint: POST /api/server/renew
                     # Body field name unknown - try multiple variants
