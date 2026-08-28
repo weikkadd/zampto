@@ -611,6 +611,7 @@ def phase_browser_renewal(cookies=None):
 def phase_api_renewal(use_cookies=None):
     """Phase 3: Use provided cookies to renew server via pure API (no browser)."""
     log.info("=== PURE API RENEWAL MODE ===")
+    cookies = use_cookies or []
 
     if not cookies:
         log.error("No valid cookies/session available - cannot proceed")
