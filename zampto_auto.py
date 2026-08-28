@@ -840,7 +840,14 @@ def phase_api_renewal(use_cookies=None):
         # Action "none" means no action taken yet, "started" means just started.
         # Either way, we need to check if renewal is required.
         if report["action"] in ("started", "skipped", "none"):
-            expiry_val = state_info.get("expiry") or state_info.get("renewal") if isinstance(state_info, dict) else None
+            # Zampto 字段含义: renewal = 上次续期时间, 到期时间 = renewal + 48h
+            expiry_val = None
+            if isinstance(state_info, dict):
+                if state_info.get("expiry"):
+                    expiry_val = state_info["expiry"]
+                elif state_info.get("renewal"):
+                    expiry_val = state_info["renewal"]
+            is_renewal_field = isinstance(state_info, dict) and bool(state_info.get("renewal")) and not bool(state_info.get("expiry"))
             if expiry_val:
                 report["expiry"] = str(expiry_val)
                 # Parse hours - support ISO datetime or "X days Y hours" string
@@ -849,8 +856,12 @@ def phase_api_renewal(use_cookies=None):
                 iso_match = re.match(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})', str(expiry_val))
                 if iso_match:
                     try:
-                        from datetime import datetime as dt_cls
+                        from datetime import datetime as dt_cls, timedelta as _td
                         expiry_dt = dt_cls.fromisoformat(iso_match.group(1).replace("Z", "+00:00"))
+                        # 若字段是 renewal (上次续期时间), 到期时间 = renewal + 48h
+                        if is_renewal_field:
+                            expiry_dt = expiry_dt + _td(hours=48)
+                            log.info("字段是 renewal, 到期时间 = renewal+48h")
                         now_dt = datetime.now(timezone.utc)
                         if expiry_dt.tzinfo is None:
                             expiry_dt = expiry_dt.replace(tzinfo=timezone.utc)
@@ -897,22 +908,49 @@ def phase_api_renewal(use_cookies=None):
                         if not fresh_csrf:
                             continue
                         try:
-                            resp = api_session.post(
-                                renew_url,
-                                json=body,
-                                timeout=15,
-                                headers={"X-CSRF-Token": fresh_csrf},
-                            )
-                            ct = resp.headers.get("content-type", "")
-                            is_json = "json" in ct.lower()
-                            log.info("    -> %d %s body=%s",
-                                     resp.status_code, "JSON" if is_json else "HTML",
-                                     resp.text[:200])
+                            # Laravel 机制: zampto_csrf cookie 值是加密+URL编码的 token,
+                            # 需 URL 解码后放进 X-XSRF-TOKEN header (后端会自动解密)
+                            # X-CSRF-Token 传原始值/解码值作为备选
+                            import urllib.parse as _up
+                            token_variants = [fresh_csrf]
+                            try:
+                                dec = _up.unquote(fresh_csrf)
+                                if dec and dec != fresh_csrf:
+                                    token_variants.append(dec)
+                            except Exception:
+                                pass
+                            header_variants = ["X-XSRF-TOKEN", "X-CSRF-Token"]
+                            renew_success = False
+                            for hdr in header_variants:
+                                for tok in token_variants:
+                                    try:
+                                        resp = api_session.post(
+                                            renew_url,
+                                            json=body,
+                                            timeout=15,
+                                            headers={hdr: tok},
+                                        )
+                                        ct = resp.headers.get("content-type", "")
+                                        is_json = "json" in ct.lower()
+                                        log.info("    -> %d %s body=%s [%s len=%d]",
+                                                 resp.status_code, "JSON" if is_json else "HTML",
+                                                 resp.text[:200], hdr, len(tok))
 
-                            if resp.status_code in [200, 201, 204, 202]:
-                                report["action"] = "renewed"
-                                log.info("  ✓ Renewal successful (status %d, body=%s)", resp.status_code, body)
-                                renewed = True
+                                        if resp.status_code in [200, 201, 204, 202]:
+                                            report["action"] = "renewed"
+                                            log.info("  ✓ Renewal successful (status %d, body=%s, hdr=%s)", resp.status_code, body, hdr)
+                                            renewed = True
+                                            renew_success = True
+                                            break
+                                        # CSRF 失败换下一个组合; 其他业务错误(如冷却期)则停止
+                                        if resp.status_code != 403 or "csrf" not in resp.text.lower():
+                                            renew_success = True  # CSRF 已通过, 是业务错误
+                                            break
+                                    except Exception as e:
+                                        log.warning("    Request failed (%s %s): %s", hdr, tok[:20], e)
+                                if renew_success:
+                                    break
+                            if renew_success:
                                 break
                             # If response says "Invalid server ID", try next variant
                             # If response says "captcha", we have a different problem
@@ -994,9 +1032,13 @@ def _report(report):
 
     log.info("--- Report ---\n%s", body)
     push_tg("🖥️ Zampto 服务器报告", body)
-    with open(os.path.join(LOG_DIR, "report.json"), "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
-    log.info("Report saved")
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(os.path.join(LOG_DIR, "report.json"), "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        log.info("Report saved")
+    except Exception as e:
+        log.warning("Report 保存失败(可忽略): %s", e)
 
 
 def main():
