@@ -269,6 +269,7 @@ def solve_turnstile(page, max_wait=30):
     import time as _time
     log.info("🎯 检查 Turnstile 验证...")
     deadline = _time.time() + max_wait
+    click_count = 0
     while _time.time() < deadline:
         try:
             # 1. 检查页面是否出现验证提示
@@ -297,37 +298,39 @@ def solve_turnstile(page, max_wait=30):
                 # 无验证, 直接通过
                 return True
 
-            # 3. 尝试点击 Turnstile checkbox
+            # 3. 用坐标点击 iframe 内的 checkbox (跨域 iframe 无法用 JS 访问,
+            #    Turnstile checkbox 位于 iframe 内部左上角区域)
             clicked = False
             try:
-                # 用 CDP 查找 iframe 内 checkbox
-                clicked = page.evaluate("""
+                # 获取 iframe 在主页面中的位置
+                box = page.evaluate("""
                 (() => {
-                    const iframes = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
-                    for (const ifr of iframes) {
-                        try {
-                            const doc = ifr.contentDocument;
-                            if (!doc) continue;
-                            const cb = doc.querySelector('input[type="checkbox"], [role="checkbox"], .ctp-checkbox-label, #challenge-stage input');
-                            if (cb) { cb.click(); return true; }
-                        } catch(e) {}
-                    }
-                    return false;
+                    const ifr = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
+                    if (!ifr) return null;
+                    const r = ifr.getBoundingClientRect();
+                    return {x: r.x + window.scrollX, y: r.y + window.scrollY, w: r.width, h: r.height};
                 })()
                 """)
-                if clicked:
-                    log.info("  ✓ 已点击 Turnstile checkbox")
+                if box and box.get("w"):
+                    # Turnstile checkbox 通常在 iframe 左侧中间, 相对位置约 (25, h/2)
+                    cx = box["x"] + min(35, box["w"] * 0.15)
+                    cy = box["y"] + box["h"] * 0.5
+                    log.info("  🖱️ 点击 Turnstile checkbox 位置 (%d, %d), iframe 尺寸 %dx%d",
+                             int(cx), int(cy), int(box["w"]), int(box["h"]))
+                    page.mouse.click(cx, cy)
+                    clicked = True
+                    click_count += 1
             except Exception as e:
-                log.warning("  点击 Turnstile checkbox 失败: %s", e)
+                log.warning("  坐标点击 Turnstile 失败: %s", e)
 
             if not clicked:
-                # 用 Playwright 原生方式: 在 iframe 内点击
+                # 兜底: Playwright iframe 内尝试
                 try:
                     for fr in page.frames:
                         furl = (fr.url or "").lower()
                         if "challenges.cloudflare.com" in furl or "turnstile" in furl:
                             try:
-                                cb = fr.query_selector('input[type="checkbox"], [role="checkbox"]')
+                                cb = fr.query_selector('input[type="checkbox"], [role="checkbox"], .ctp-checkbox-label')
                                 if cb:
                                     cb.click(force=True)
                                     clicked = True
@@ -340,12 +343,20 @@ def solve_turnstile(page, max_wait=30):
 
             if clicked:
                 _time.sleep(4)
-                # 验证是否通过: 重新检查
+                # 验证是否通过: 重新检查 (iframe 消失/验证文字消失 = 通过)
                 try:
                     body_text2 = page.evaluate("document.body ? document.body.innerText : ''") or ""
-                    if not any(w in body_text2.lower() for w in
-                               ["security verification", "complete the security", "verification required",
-                                "loading security"]):
+                    frames2 = []
+                    try:
+                        frames2 = page.frames
+                    except Exception:
+                        pass
+                    frame_gone = all(("challenges.cloudflare.com" not in (f.url or "").lower() and
+                                      "turnstile" not in (f.url or "").lower())
+                                     for f in frames2)
+                    if (not any(w in body_text2.lower() for w in
+                                ["security verification", "complete the security", "verification required",
+                                 "loading security"]) and frame_gone):
                         log.info("  ✅ Turnstile 验证通过")
                         return True
                 except Exception:
@@ -354,7 +365,7 @@ def solve_turnstile(page, max_wait=30):
         except Exception as e:
             log.warning("Turnstile 处理异常: %s", e)
             _time.sleep(2)
-    log.warning("⏰ Turnstile 验证超时(%ds)", max_wait)
+    log.warning("⏰ Turnstile 验证超时(%ds, 点击%d次)", max_wait, click_count)
     return False
 
 
