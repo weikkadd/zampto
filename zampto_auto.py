@@ -333,21 +333,35 @@ def renew_via_browser_fetch(page, sid):
             js = f"""
 (async () => {{
     try {{
+        // 从 cookie 提取 XSRF-TOKEN 并 URL 解码 (Laravel/Pelican 风格)
+        const m = document.cookie.match(/(?:^|;\\s*)XSRF-TOKEN=([^;]+)/);
+        const xsrf = m ? decodeURIComponent(m[1]) : '';
         const res = await fetch('/api/server/renew', {{
             method: 'POST',
-            headers: {{'Content-Type': 'application/json'}},
+            headers: {{
+                'Content-Type': 'application/json',
+                'X-XSRF-TOKEN': xsrf,
+                'Accept': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+            }},
             body: '{_json.dumps(body)}',
         }});
         const text = await res.text();
-        return JSON.stringify({{status: res.status, body: text}});
+        return JSON.stringify({{status: res.status, body: text, xsrfLen: xsrf.length}});
     }} catch(e) {{ return JSON.stringify({{status: 0, body: e.message}}); }}
 }})();
 """
             result = page.evaluate(js)
             data = _json.loads(result)
-            log.info("  fetch /api/server/renew body=%s -> HTTP %s", body, data.get("status"))
+            log.info("  fetch /api/server/renew body=%s -> HTTP %s (xsrfLen=%s) resp=%s",
+                     body, data.get("status"), data.get("xsrfLen"),
+                     str(data.get("body", ""))[:200])
             if data.get("status") in (200, 201, 204, 202):
                 return True, data
+            # 403 + body 里提示 csrf 问题: 说明 token 缺失, 继续尝试其他 body 也无意义
+            if data.get("status") == 403 and "csrf" in str(data.get("body", "")).lower():
+                log.warning("  403 CSRF 校验失败, 尝试用页面按钮续期")
+                break
         except Exception as e:
             log.warning("  fetch attempt failed: %s", e)
     return False, None
