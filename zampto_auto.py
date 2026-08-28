@@ -1049,8 +1049,17 @@ def main():
         _report(report)
         sys.exit(1)  # Non-zero exit so workflow marks as failure
 
-    # 浏览器自动续期 (带 CSRF 支持)
-    log.info("Starting browser-based server check & renewal...")
+    # 优先: 纯 API 续期 (requests 能从 Set-Cookie 获取 zampto_csrf, 用 X-CSRF-Token header)
+    # 成功(skipped/renewed/manual)时内部已推送报告, 直接退出
+    # 失败(401/找不到端点/请求异常)时回退浏览器模式
+    log.info("Starting pure API renewal (CSRF-aware)...")
+    api_ok = phase_api_renewal(use_cookies=cookies)
+    if api_ok:
+        log.info("✅ API 续期流程完成 (报告已通过 API 路径推送)")
+        sys.exit(0)
+
+    # 回退: 浏览器续期 (document.cookie 读不到 HttpOnly 的 zampto_csrf, 仅作兜底)
+    log.info("API 续期未成功, 回退浏览器模式...")
     status = phase_browser_renewal(cookies=cookies)
 
     # 查询最新到期时间
