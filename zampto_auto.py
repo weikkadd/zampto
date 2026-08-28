@@ -333,49 +333,62 @@ def renew_via_browser_fetch(page, sid):
             js = f"""
 (async () => {{
     try {{
-        // 从 cookie 提取 CSRF token: 支持 XSRF-TOKEN / zampto_csrf / 任何含 csrf 的 cookie
-        let xsrf = '';
+        // 收集所有候选 CSRF token (meta 优先, 其次 cookie 各种形式)
+        const candidates = [];
+        const meta = document.querySelector('meta[name="csrf-token"]');
+        if (meta && meta.getAttribute('content')) candidates.push(meta.getAttribute('content').trim());
         const cookieParts = document.cookie.split(';');
         for (const part of cookieParts) {{
             const kv = part.trim().split('=');
             if (kv.length < 2) continue;
             const name = kv[0].trim();
             if (name === 'XSRF-TOKEN' || name === 'zampto_csrf' || /csrf/i.test(name)) {{
-                try {{ xsrf = decodeURIComponent(kv.slice(1).join('=')); }}
-                catch(e) {{ xsrf = kv.slice(1).join('='); }}
+                const raw = kv.slice(1).join('=');
+                if (raw && !candidates.includes(raw)) candidates.push(raw);
+                try {{
+                    const dec = decodeURIComponent(raw);
+                    if (dec && !candidates.includes(dec)) candidates.push(dec);
+                }} catch(e) {{}}
                 break;
             }}
         }}
-        // 兜底: 从 meta 标签读取
-        if (!xsrf) {{
-            const meta = document.querySelector('meta[name="csrf-token"]');
-            if (meta) xsrf = meta.getAttribute('content') || '';
+        // 逐个候选 x 两种 header 名尝试
+        const headerNames = ['X-XSRF-TOKEN', 'X-CSRF-TOKEN'];
+        for (const tok of candidates) {{
+            for (const hdr of headerNames) {{
+                const res = await fetch('/api/server/renew', {{
+                    method: 'POST',
+                    headers: {{
+                        'Content-Type': 'application/json',
+                        [hdr]: tok,
+                        'Accept': 'application/json',
+                        'X-Requested-With': 'XMLHttpRequest',
+                    }},
+                    body: '{_json.dumps(body)}',
+                }});
+                const text = await res.text();
+                const ok = [200, 201, 204, 202].includes(res.status);
+                if (ok) return JSON.stringify({{status: res.status, body: text, header: hdr, tokLen: tok.length, ok: true}});
+                // 非 CSRF 错误的响应: 说明 token 对了, 是业务错误(如冷却期)
+                if (res.status !== 403 || !/csrf/i.test(text)) {{
+                    return JSON.stringify({{status: res.status, body: text, header: hdr, tokLen: tok.length, ok: false, final: true}});
+                }}
+            }}
         }}
-        const res = await fetch('/api/server/renew', {{
-            method: 'POST',
-            headers: {{
-                'Content-Type': 'application/json',
-                'X-XSRF-TOKEN': xsrf,
-                'Accept': 'application/json',
-                'X-Requested-With': 'XMLHttpRequest',
-            }},
-            body: '{_json.dumps(body)}',
-        }});
-        const text = await res.text();
-        return JSON.stringify({{status: res.status, body: text, xsrfLen: xsrf.length}});
-    }} catch(e) {{ return JSON.stringify({{status: 0, body: e.message}}); }}
+        return JSON.stringify({{status: -1, body: 'all csrf attempts failed', ok: false}});
+    }} catch(e) {{ return JSON.stringify({{status: 0, body: e.message, ok: false}}); }}
 }})();
 """
             result = page.evaluate(js)
             data = _json.loads(result)
-            log.info("  fetch /api/server/renew body=%s -> HTTP %s (xsrfLen=%s) resp=%s",
-                     body, data.get("status"), data.get("xsrfLen"),
+            log.info("  fetch /api/server/renew body=%s -> HTTP %s (header=%s tokLen=%s) resp=%s",
+                     body, data.get("status"), data.get("header"), data.get("tokLen"),
                      str(data.get("body", ""))[:200])
             if data.get("status") in (200, 201, 204, 202):
                 return True, data
-            # 403 + body 里提示 csrf 问题: 说明 token 缺失, 继续尝试其他 body 也无意义
-            if data.get("status") == 403 and "csrf" in str(data.get("body", "")).lower():
-                log.warning("  403 CSRF 校验失败, 尝试用页面按钮续期")
+            # 非 403 或业务错误: 说明 CSRF 已通过, 继续试其他 body 无意义
+            if data.get("final") or (data.get("status") not in (403, -1, 0)):
+                log.warning("  CSRF 已通过但业务失败(status=%s), 停止尝试", data.get("status"))
                 break
         except Exception as e:
             log.warning("  fetch attempt failed: %s", e)
@@ -534,17 +547,21 @@ def phase_browser_renewal(cookies=None):
         log.info("fetch 失败, 尝试在页面中寻找 Renew 按钮...")
         try:
             # 先移除可能存在的 Cookie 同意弹窗 (fc-consent-root 会拦截点击)
+            # 注意: 只删除顶层容器, 不要用 [class*="fc-consent"] 通配 (会误删页面 UI)
             try:
                 removed = page.evaluate("""
                 (() => {
-                    const els = document.querySelectorAll('.fc-consent-root, .fc-dialog, .fc-dialog-overlay, [class*="fc-consent"], #onetrust-consent-sdk');
+                    const roots = document.querySelectorAll('.fc-consent-root, #onetrust-consent-sdk');
                     let n = 0;
-                    els.forEach(el => { el.remove(); n++; });
+                    roots.forEach(el => { el.remove(); n++; });
+                    // 兜底: 移除可见的 dialog/overlay 弹窗
+                    const overlays = document.querySelectorAll('div[role="dialog"], .fc-dialog-overlay');
+                    overlays.forEach(el => { if (el.offsetParent !== null || el.getClientRects().length) { el.remove(); n++; } });
                     return n;
                 })();
                 """)
                 if removed:
-                    log.info("🍪 已移除 Cookie 弹窗元素: %d 个", removed)
+                    log.info("🍪 已移除 Cookie 弹窗容器: %d 个", removed)
                     page.wait_for_timeout(500)
             except Exception as e:
                 log.warning("移除 Cookie 弹窗失败(可忽略): %s", e)
