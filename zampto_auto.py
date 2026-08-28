@@ -263,6 +263,101 @@ def click_btn(page, selector):
     return False
 
 
+def solve_turnstile(page, max_wait=30):
+    """检测并尝试自动通过 Cloudflare Turnstile 验证。
+    返回 True 表示验证已通过/无需验证, False 表示失败或超时。"""
+    import time as _time
+    log.info("🎯 检查 Turnstile 验证...")
+    deadline = _time.time() + max_wait
+    while _time.time() < deadline:
+        try:
+            # 1. 检查页面是否出现验证提示
+            body_text = ""
+            try:
+                body_text = page.evaluate("document.body ? document.body.innerText : ''") or ""
+            except Exception:
+                pass
+            has_verify = any(w in body_text.lower() for w in
+                             ["security verification", "complete the security", "verification required",
+                              "loading security", "please complete"])
+            # 2. 查找 Turnstile iframe (challenges.cloudflare.com)
+            has_frame = False
+            try:
+                frames = page.frames
+                for fr in frames:
+                    furl = (fr.url or "").lower()
+                    if "challenges.cloudflare.com" in furl or "turnstile" in furl:
+                        has_frame = True
+                        log.info("  ✓ 发现 Turnstile iframe: %s", fr.url[:80])
+                        break
+            except Exception:
+                pass
+
+            if not has_verify and not has_frame:
+                # 无验证, 直接通过
+                return True
+
+            # 3. 尝试点击 Turnstile checkbox
+            clicked = False
+            try:
+                # 用 CDP 查找 iframe 内 checkbox
+                clicked = page.evaluate("""
+                (() => {
+                    const iframes = document.querySelectorAll('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
+                    for (const ifr of iframes) {
+                        try {
+                            const doc = ifr.contentDocument;
+                            if (!doc) continue;
+                            const cb = doc.querySelector('input[type="checkbox"], [role="checkbox"], .ctp-checkbox-label, #challenge-stage input');
+                            if (cb) { cb.click(); return true; }
+                        } catch(e) {}
+                    }
+                    return false;
+                })()
+                """)
+                if clicked:
+                    log.info("  ✓ 已点击 Turnstile checkbox")
+            except Exception as e:
+                log.warning("  点击 Turnstile checkbox 失败: %s", e)
+
+            if not clicked:
+                # 用 Playwright 原生方式: 在 iframe 内点击
+                try:
+                    for fr in page.frames:
+                        furl = (fr.url or "").lower()
+                        if "challenges.cloudflare.com" in furl or "turnstile" in furl:
+                            try:
+                                cb = fr.query_selector('input[type="checkbox"], [role="checkbox"]')
+                                if cb:
+                                    cb.click(force=True)
+                                    clicked = True
+                                    log.info("  ✓ Playwright 点击 Turnstile checkbox")
+                                    break
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+            if clicked:
+                _time.sleep(4)
+                # 验证是否通过: 重新检查
+                try:
+                    body_text2 = page.evaluate("document.body ? document.body.innerText : ''") or ""
+                    if not any(w in body_text2.lower() for w in
+                               ["security verification", "complete the security", "verification required",
+                                "loading security"]):
+                        log.info("  ✅ Turnstile 验证通过")
+                        return True
+                except Exception:
+                    pass
+            _time.sleep(2)
+        except Exception as e:
+            log.warning("Turnstile 处理异常: %s", e)
+            _time.sleep(2)
+    log.warning("⏰ Turnstile 验证超时(%ds)", max_wait)
+    return False
+
+
 def wait_for_url_change(page, start_url, max_wait=30):
     """Poll until URL changes from start_url."""
     for i in range(max_wait):
@@ -576,8 +671,14 @@ def phase_browser_renewal(cookies=None):
                 except Exception:
                     renew_btn.click(force=True)
                     log.info("force click 成功")
-                page.wait_for_timeout(5000)
+                page.wait_for_timeout(3000)
                 snap(page, "03_after_renew.png")
+                # 处理 Turnstile 安全验证 (Zampto 续期需要人机验证)
+                turnstile_ok = solve_turnstile(page, max_wait=40)
+                if not turnstile_ok:
+                    log.warning("Turnstile 未自动通过, 尝试继续等待后验证")
+                page.wait_for_timeout(3000)
+                snap(page, "04_after_verify.png")
                 log.info("按钮点击完成, 等待 3s 后验证续期结果...")
                 page.wait_for_timeout(3000)
                 # 验证续期是否真的生效: 重新查询 renewal, 与点击前对比
