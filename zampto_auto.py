@@ -265,8 +265,12 @@ def click_btn(page, selector):
 
 def solve_turnstile(page, max_wait=30):
     """检测并尝试自动通过 Cloudflare Turnstile 验证。
-    返回 True 表示验证已通过/无需验证, False 表示失败或超时。"""
+    返回 True 表示验证已通过/无需验证, False 表示失败或超时。
+
+    采用真实浏览器行为模拟: 随机鼠标轨迹 + 拟人化延迟, 降低被 CF 检测为自动化的概率。
+    """
     import time as _time
+    import random as _random
     log.info("🎯 检查 Turnstile 验证...")
     deadline = _time.time() + max_wait
     click_count = 0
@@ -298,11 +302,9 @@ def solve_turnstile(page, max_wait=30):
                 # 无验证, 直接通过
                 return True
 
-            # 3. 用坐标点击 iframe 内的 checkbox (跨域 iframe 无法用 JS 访问,
-            #    Turnstile checkbox 位于 iframe 内部左上角区域)
-            clicked = False
+            # 3. 获取 iframe 位置
+            box = None
             try:
-                # 获取 iframe 在主页面中的位置
                 box = page.evaluate("""
                 (() => {
                     const ifr = document.querySelector('iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]');
@@ -311,19 +313,39 @@ def solve_turnstile(page, max_wait=30):
                     return {x: r.x + window.scrollX, y: r.y + window.scrollY, w: r.width, h: r.height};
                 })()
                 """)
-                if box and box.get("w"):
-                    # Turnstile checkbox 通常在 iframe 左侧中间, 相对位置约 (25, h/2)
-                    cx = box["x"] + min(35, box["w"] * 0.15)
-                    cy = box["y"] + box["h"] * 0.5
-                    log.info("  🖱️ 点击 Turnstile checkbox 位置 (%d, %d), iframe 尺寸 %dx%d",
-                             int(cx), int(cy), int(box["w"]), int(box["h"]))
-                    page.mouse.click(cx, cy)
-                    clicked = True
-                    click_count += 1
-            except Exception as e:
-                log.warning("  坐标点击 Turnstile 失败: %s", e)
+            except Exception:
+                pass
 
-            if not clicked:
+            if box and box.get("w"):
+                # Turnstile checkbox 在 iframe 左侧中间
+                target_x = box["x"] + min(35, box["w"] * 0.15) + _random.uniform(-3, 3)
+                target_y = box["y"] + box["h"] * 0.5 + _random.uniform(-3, 3)
+                # 拟人化: 从随机起点分 2-3 段移动过去, 每段有随机停顿
+                start_x = _random.uniform(200, 600)
+                start_y = _random.uniform(100, 500)
+                try:
+                    page.mouse.move(start_x, start_y)
+                    _time.sleep(_random.uniform(0.2, 0.6))
+                except Exception:
+                    pass
+                steps = _random.randint(2, 4)
+                for i in range(1, steps + 1):
+                    ix = start_x + (target_x - start_x) * i / steps + _random.uniform(-15, 15)
+                    iy = start_y + (target_y - start_y) * i / steps + _random.uniform(-15, 15)
+                    try:
+                        page.mouse.move(ix, iy)
+                    except Exception:
+                        pass
+                    _time.sleep(_random.uniform(0.15, 0.4))
+                _time.sleep(_random.uniform(0.1, 0.3))
+                log.info("  🖱️ 拟人化点击 Turnstile checkbox (%d, %d)",
+                         int(target_x), int(target_y))
+                try:
+                    page.mouse.click(target_x, target_y)
+                    click_count += 1
+                except Exception as e:
+                    log.warning("  坐标点击失败: %s", e)
+            else:
                 # 兜底: Playwright iframe 内尝试
                 try:
                     for fr in page.frames:
@@ -333,7 +355,7 @@ def solve_turnstile(page, max_wait=30):
                                 cb = fr.query_selector('input[type="checkbox"], [role="checkbox"], .ctp-checkbox-label')
                                 if cb:
                                     cb.click(force=True)
-                                    clicked = True
+                                    click_count += 1
                                     log.info("  ✓ Playwright 点击 Turnstile checkbox")
                                     break
                             except Exception:
@@ -341,26 +363,25 @@ def solve_turnstile(page, max_wait=30):
                 except Exception:
                     pass
 
-            if clicked:
-                _time.sleep(4)
-                # 验证是否通过: 重新检查 (iframe 消失/验证文字消失 = 通过)
+            _time.sleep(4)
+            # 验证是否通过: 验证文字消失 + iframe 消失
+            try:
+                body_text2 = page.evaluate("document.body ? document.body.innerText : ''") or ""
+                frames2 = []
                 try:
-                    body_text2 = page.evaluate("document.body ? document.body.innerText : ''") or ""
-                    frames2 = []
-                    try:
-                        frames2 = page.frames
-                    except Exception:
-                        pass
-                    frame_gone = all(("challenges.cloudflare.com" not in (f.url or "").lower() and
-                                      "turnstile" not in (f.url or "").lower())
-                                     for f in frames2)
-                    if (not any(w in body_text2.lower() for w in
-                                ["security verification", "complete the security", "verification required",
-                                 "loading security"]) and frame_gone):
-                        log.info("  ✅ Turnstile 验证通过")
-                        return True
+                    frames2 = page.frames
                 except Exception:
                     pass
+                frame_gone = all(("challenges.cloudflare.com" not in (f.url or "").lower() and
+                                  "turnstile" not in (f.url or "").lower())
+                                 for f in frames2)
+                if (not any(w in body_text2.lower() for w in
+                            ["security verification", "complete the security", "verification required",
+                             "loading security"]) and frame_gone):
+                    log.info("  ✅ Turnstile 验证通过")
+                    return True
+            except Exception:
+                pass
             _time.sleep(2)
         except Exception as e:
             log.warning("Turnstile 处理异常: %s", e)
