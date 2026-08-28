@@ -51,15 +51,15 @@ jobs:
           pip install -r requirements.txt
           python -c "from cloakbrowser import ensure_binary; ensure_binary()"
 
-      - name: 🌐 启动 TUIC 代理（可选）
+      - name: 🌐 启动 TUIC 代理
         env:
           TUIC_URI: ${{ secrets.TUIC_URI }}
         run: |
           set -e
           if [ -z "$TUIC_URI" ]; then
-            echo "TUIC_URI not set, skipping proxy"
-            echo "Direct IP: $(curl -s --max-time 5 ifconfig.me || echo 'fail')"
-            exit 0
+            echo "[ERROR] TUIC_URI 未配置! GitHub 裸 IP 会被 Cloudflare 风控(403), 续期必失败"
+            echo "请到 Settings -> Secrets 添加 TUIC_URI (tuic:// 节点链接)"
+            exit 1
           fi
 
           echo "[1/4] Parsing TUIC URI ..."
@@ -162,7 +162,7 @@ jobs:
           echo "Direct IP: $(curl -s --max-time 5 ifconfig.me || echo 'fail')"
           echo "Proxy IP:  $(curl -s --max-time 15 --socks5 127.0.0.1:1080 ifconfig.me || echo 'proxy fail')"
 
-          # If proxy works, export env for subsequent step via $GITHUB_ENV
+          # 代理必须可用: 没有代理 -> GitHub 裸 IP 会被 Cloudflare 风控(403), 续期必失败
           if curl -s --max-time 10 --socks5-hostname 127.0.0.1:1080 https://www.google.com -o /dev/null; then
             echo "PROXY_OK=1" >> $GITHUB_ENV
             echo "ALL_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
@@ -170,7 +170,11 @@ jobs:
             echo "HTTPS_PROXY=socks5h://127.0.0.1:1080" >> $GITHUB_ENV
             echo "[OK] TUIC proxy is ready"
           else
-            echo "[WARN] TUIC proxy health check failed, will proceed anyway"
+            echo "[ERROR] TUIC proxy is DOWN - cannot renew (GitHub IP blocked by Cloudflare)"
+            echo "---- sing-box log ----"
+            cat /tmp/tuic.log 2>/dev/null | tail -30 || echo "no log"
+            echo "----------------------"
+            exit 1
           fi
 
       - name: 🔄 运行续期脚本

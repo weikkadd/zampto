@@ -351,6 +351,49 @@ def renew_via_browser_fetch(page, sid):
     return False, None
 
 
+def query_renewal_field(cookies=None, page=None):
+    """查询服务器 renewal 字段 (上次续期时间, 到期 = renewal + 48h)。
+
+    优先用浏览器上下文 fetch (带 Cloudflare token, 最可靠),
+    失败则回退 requests. 返回 renewal 原始字符串, 查不到返回 None.
+    """
+    # 方式1: 浏览器上下文 fetch (带 CF token)
+    if page is not None:
+        try:
+            js = """
+            (async () => {
+                try {
+                    const res = await fetch('/api/servers', {headers: {'Accept': 'application/json'}});
+                    if (!res.ok) return JSON.stringify({ok: false, status: res.status});
+                    const j = await res.json();
+                    return JSON.stringify({ok: true, data: j});
+                } catch(e) { return JSON.stringify({ok: false, error: e.message}); }
+            })();
+            """
+            result = page.evaluate(js)
+            data = json.loads(result)
+            if data.get("ok"):
+                j = data["data"]
+                for sv in (j.get("servers") or []):
+                    if str(sv.get("id")) == str(SERVER_ID):
+                        return sv.get("renewal")
+        except Exception as e:
+            log.warning("浏览器查询 renewal 失败: %s", e)
+    # 方式2: requests
+    if cookies:
+        try:
+            api = get_api_session()
+            sync_cookies_to_session(api, cookies)
+            r = api.get(f"{DASHBOARD_URL}/api/servers", timeout=10)
+            if r.status_code == 200:
+                for sv in (r.json().get("servers") or []):
+                    if str(sv.get("id")) == str(SERVER_ID):
+                        return sv.get("renewal")
+        except Exception as e:
+            log.warning("requests 查询 renewal 失败: %s", e)
+    return None
+
+
 def phase_browser_renewal(cookies=None):
     """Phase 2: 浏览器自动续期。
     返回: "renewed" / "skipped" / "failed" """
@@ -365,7 +408,8 @@ def phase_browser_renewal(cookies=None):
         log.error("No cookies available")
         return "failed"
 
-    # 预检查剩余时间
+    # 记录续期前的 renewal (上次续期时间), 用于点击后对比验证
+    baseline_renewal = None
     try:
         api = get_api_session()
         sync_cookies_to_session(api, cookies)
@@ -374,6 +418,7 @@ def phase_browser_renewal(cookies=None):
             for sv in (r.json().get("servers") or []):
                 if str(sv.get("id")) == str(SERVER_ID):
                     exp_raw = sv.get("renewal", "")
+                    baseline_renewal = exp_raw or None
                     if exp_raw:
                         from datetime import datetime as dt_cls, timedelta
                         dt_ob = dt_cls.fromisoformat(exp_raw.replace("Z", "+00:00"))
@@ -382,8 +427,9 @@ def phase_browser_renewal(cookies=None):
                         if rem_h > 42:
                             log.info("剩余 %.0fh (>42h), 跳过续期", rem_h)
                             return "skipped"
-    except:
-        pass
+    except Exception as e:
+        log.warning("预检查剩余时间失败(可能被CF拦截): %s", e)
+    log.info("续期前 renewal: %r", baseline_renewal)
 
     log.info("Launching CloakBrowser headless...")
     proxy = None
@@ -451,9 +497,17 @@ def phase_browser_renewal(cookies=None):
                 renew_btn.click()
                 page.wait_for_timeout(5000)
                 snap(page, "03_after_renew.png")
-                log.info("按钮点击完成")
+                log.info("按钮点击完成, 等待 3s 后验证续期结果...")
+                page.wait_for_timeout(3000)
+                # 验证续期是否真的生效: 重新查询 renewal, 与点击前对比
+                new_renewal = query_renewal_field(cookies=cookies, page=page)
+                log.info("续期后 renewal: %r (点击前: %r)", new_renewal, baseline_renewal)
                 browser.close()
-                return "renewed"
+                if new_renewal and new_renewal != baseline_renewal:
+                    log.info("✅ 续期确认成功: renewal 已更新")
+                    return "renewed"
+                log.error("❌ 续期失败: 点击后 renewal 未变化, 续期未生效")
+                return "failed"
             else:
                 log.info("页面中未找到 Renew 按钮 - 需要手动检查页面")
                 snap(page, "03_no_renew_btn.png")
@@ -462,8 +516,13 @@ def phase_browser_renewal(cookies=None):
 
         snap(page, "03_renew_result.png")
         browser.close()
-        # 即使没找到按钮, 也不标记为错误——可能是有效期还很长
-        return "renewed"
+        # 没找到按钮: 再查一次 renewal 看是否已变化(可能 fetch 已成功但未识别)
+        final_renewal = query_renewal_field(cookies=cookies)
+        if final_renewal and final_renewal != baseline_renewal:
+            log.info("✅ 续期确认成功: renewal 已更新 (fetch 路径)")
+            return "renewed"
+        log.error("❌ 续期失败: 未找到续期按钮且 renewal 未变化")
+        return "failed"
     except Exception as e:
         log.error("Browser mode failed: %s", e)
         return "failed"
