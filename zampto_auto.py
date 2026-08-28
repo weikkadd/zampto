@@ -495,10 +495,32 @@ def phase_browser_renewal(cookies=None):
         # 如果 fetch 失败, 尝试从页面找续期按钮
         log.info("fetch 失败, 尝试在页面中寻找 Renew 按钮...")
         try:
+            # 先移除可能存在的 Cookie 同意弹窗 (fc-consent-root 会拦截点击)
+            try:
+                removed = page.evaluate("""
+                (() => {
+                    const els = document.querySelectorAll('.fc-consent-root, .fc-dialog, .fc-dialog-overlay, [class*="fc-consent"], #onetrust-consent-sdk');
+                    let n = 0;
+                    els.forEach(el => { el.remove(); n++; });
+                    return n;
+                })();
+                """)
+                if removed:
+                    log.info("🍪 已移除 Cookie 弹窗元素: %d 个", removed)
+                    page.wait_for_timeout(500)
+            except Exception as e:
+                log.warning("移除 Cookie 弹窗失败(可忽略): %s", e)
+
             renew_btn = page.query_selector('button:has-text("Renew"), a:has-text("Renew"), [data-action="renew"], #renew-btn')
             if renew_btn:
                 log.info("找到了 Renew 按钮, 点击...")
-                renew_btn.click()
+                # 用 JS 直接触发 click, 避免被 Cookie 弹窗 overlay 拦截
+                try:
+                    renew_btn.evaluate("(el) => { el.click(); return true; }")
+                    log.info("JS click 成功")
+                except Exception:
+                    renew_btn.click(force=True)
+                    log.info("force click 成功")
                 page.wait_for_timeout(5000)
                 snap(page, "03_after_renew.png")
                 log.info("按钮点击完成, 等待 3s 后验证续期结果...")
