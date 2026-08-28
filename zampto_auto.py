@@ -333,9 +333,24 @@ def renew_via_browser_fetch(page, sid):
             js = f"""
 (async () => {{
     try {{
-        // 从 cookie 提取 XSRF-TOKEN 并 URL 解码 (Laravel/Pelican 风格)
-        const m = document.cookie.match(/(?:^|;\\s*)XSRF-TOKEN=([^;]+)/);
-        const xsrf = m ? decodeURIComponent(m[1]) : '';
+        // 从 cookie 提取 CSRF token: 支持 XSRF-TOKEN / zampto_csrf / 任何含 csrf 的 cookie
+        let xsrf = '';
+        const cookieParts = document.cookie.split(';');
+        for (const part of cookieParts) {{
+            const kv = part.trim().split('=');
+            if (kv.length < 2) continue;
+            const name = kv[0].trim();
+            if (name === 'XSRF-TOKEN' || name === 'zampto_csrf' || /csrf/i.test(name)) {{
+                try {{ xsrf = decodeURIComponent(kv.slice(1).join('=')); }}
+                catch(e) {{ xsrf = kv.slice(1).join('='); }}
+                break;
+            }}
+        }}
+        // 兜底: 从 meta 标签读取
+        if (!xsrf) {{
+            const meta = document.querySelector('meta[name="csrf-token"]');
+            if (meta) xsrf = meta.getAttribute('content') || '';
+        }}
         const res = await fetch('/api/server/renew', {{
             method: 'POST',
             headers: {{
