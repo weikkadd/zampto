@@ -469,13 +469,22 @@ def phase_browser_renewal(cookies=None):
                     "secure": c.get("secure", True),
                 }
                 if c["name"].startswith("__Host-"):
-                    # __Host- 不能含 domain
-                    cookie["domain"] = ".zampto.net"
+                    # __Host- 前缀: 不能含 domain 属性, 必须 path="/", secure=True
+                    # Playwright add_cookies 用 url 指定作用域即可, 不能设 domain
+                    pass
                 else:
                     cookie["domain"] = c.get("domain", ".zampto.net")
                 ctx.add_cookies([cookie])
             except Exception as e:
                 log.warning("  skip cookie %s: %s", c["name"], e)
+
+        # 验证注入结果: 打印浏览器实际 cookie 名 (确认 XSRF-TOKEN/session 是否注入成功)
+        try:
+            real_cookies = ctx.cookies()
+            real_names = [ck["name"] for ck in real_cookies]
+            log.info("📋 浏览器实际 Cookies(%d): %s", len(real_names), real_names)
+        except Exception as e:
+            log.warning("读取浏览器 cookie 失败: %s", e)
 
         # 访问面板主页
         log.info("导航到 %s ...", DASHBOARD_URL)
