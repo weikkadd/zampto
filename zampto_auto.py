@@ -1624,21 +1624,38 @@ def main():
     status = phase_browser_renewal(cookies=cookies)
 
     # 查询最新到期时间
+    # 续期成功后服务器更新 renewal 字段可能有几秒延迟, 用重试 + 等待机制确保
+    # 拿到的是续期后的新值, 而不是续期前的旧值.
     expiry_str = ""
-    try:
-        api = get_api_session()
-        sync_cookies_to_session(api, cookies)
-        r = api.get(f"{DASHBOARD_URL}/api/servers", timeout=10)
-        if r.status_code == 200:
-            for sv in (r.json().get("servers") or []):
-                if str(sv.get("id")) == str(SERVER_ID):
-                    exp_raw = sv.get("renewal", "")
-                    if exp_raw:
+    if status == "renewed":
+        # 续期刚成功, 等服务器更新 renewal 字段
+        log.info("等待服务器更新 renewal 字段...")
+        for attempt in range(3):
+            time.sleep(3)  # 给服务器 3s 缓存刷新时间
+            try:
+                api = get_api_session()
+                sync_cookies_to_session(api, cookies)
+                r = api.get(f"{DASHBOARD_URL}/api/servers", timeout=10)
+                if r.status_code != 200:
+                    continue
+                for sv in (r.json().get("servers") or []):
+                    if str(sv.get("id")) == str(SERVER_ID):
+                        exp_raw = sv.get("renewal", "")
+                        if not exp_raw:
+                            continue
                         from datetime import datetime as dt_cls, timedelta
                         try:
                             dt_ob = dt_cls.fromisoformat(exp_raw.replace("Z", "+00:00"))
-                            expires_at = dt_ob + timedelta(hours=48)
+                            # 新 renewal 应该接近 now (续期刚发生), 旧 renewal 会比 now 早很多
                             now = datetime.now(timezone.utc)
+                            age_s = (now - dt_ob).total_seconds()
+                            log.info(f"  尝试 {attempt+1}: renewal={exp_raw} (age={age_s:.0f}s)")
+                            # 续期成功后 renewal 应该是 0-300s 内的时间戳
+                            # 如果 age > 60s, 说明服务器还没更新, 再等
+                            if age_s > 60:
+                                continue
+                            # 通过, 算 expiry_str
+                            expires_at = dt_ob + timedelta(hours=48)
                             if expires_at.tzinfo is None:
                                 expires_at = expires_at.replace(tzinfo=timezone.utc)
                             total_s = int((expires_at - now).total_seconds())
@@ -1651,11 +1668,50 @@ def main():
                                 if h > 0: parts.append(f"{h}h")
                                 parts.append(f"{m}min")
                                 expiry_str = " ".join(parts)
-                        except:
-                            pass
+                                log.info(f"  ✓ 到期时间已更新: {expiry_str}")
+                                break
+                        except Exception as e:
+                            log.warning(f"  解析 renewal 失败: {e}")
+                        break
+                if expiry_str:
                     break
-    except:
-        pass
+            except Exception as e:
+                log.warning(f"  查询 renewal 失败 (尝试 {attempt+1}): {e}")
+        if not expiry_str:
+            log.warning("⚠️ 3 次尝试后仍未拿到更新的 renewal 字段, 用首次查询值兜底")
+    # 跳过续期 / 续期失败的情况下, 单次查询就够 (不需要等)
+    if not expiry_str:
+        try:
+            api = get_api_session()
+            sync_cookies_to_session(api, cookies)
+            r = api.get(f"{DASHBOARD_URL}/api/servers", timeout=10)
+            if r.status_code == 200:
+                for sv in (r.json().get("servers") or []):
+                    if str(sv.get("id")) == str(SERVER_ID):
+                        exp_raw = sv.get("renewal", "")
+                        if exp_raw:
+                            from datetime import datetime as dt_cls, timedelta
+                            try:
+                                dt_ob = dt_cls.fromisoformat(exp_raw.replace("Z", "+00:00"))
+                                expires_at = dt_ob + timedelta(hours=48)
+                                now = datetime.now(timezone.utc)
+                                if expires_at.tzinfo is None:
+                                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                                total_s = int((expires_at - now).total_seconds())
+                                if total_s > 0:
+                                    d = total_s // 86400
+                                    h = (total_s % 86400) // 3600
+                                    m = (total_s % 3600) // 60
+                                    parts = []
+                                    if d > 0: parts.append(f"{d}d")
+                                    if h > 0: parts.append(f"{h}h")
+                                    parts.append(f"{m}min")
+                                    expiry_str = " ".join(parts)
+                            except:
+                                pass
+                        break
+        except:
+            pass
 
     if status == "renewed":
         log.info("✓ 续期成功")
