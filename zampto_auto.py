@@ -153,12 +153,18 @@ def find_csrf_cookie(cookies):
 def refresh_csrf_token(api_session, base_url=DASHBOARD_URL, server_id=None):
     """Get a fresh CSRF token from server response.
 
-    Zampto 已不再在 Set-Cookie header 中返回 zampto_csrf。
-    本函数依次尝试:
-      1. Set-Cookie header (旧方法)
-      2. HTML body 解析 (<meta> / JS 变量)
-      3. session.cookies (旧 token, 可能已过期)
+    优先用 requests 内置的 r.cookies (RequestsCookieJar, 自动从 Set-Cookie 解析),
+    再回退 Set-Cookie header 字符串解析 (兼容老代理), 最后回退 HTML <meta> / JS 提取。
+
+    会尝试多种常见 CSRF cookie 名:
+      zampto_csrf / XSRF-TOKEN / __Host-zampto_csrf / __Host-XSRF-TOKEN
+      csrf_token / xsrf_token / laravel_csrf_token
     """
+    CSRF_COOKIE_NAMES = [
+        "zampto_csrf", "XSRF-TOKEN", "__Host-zampto_csrf", "__Host-XSRF-TOKEN",
+        "csrf_token", "xsrf_token", "laravel_csrf_token",
+    ]
+
     def extract_csrf(text):
         """从 HTML 中提取 CSRF token"""
         # <meta name="csrf-token" content="...">
@@ -166,10 +172,20 @@ def refresh_csrf_token(api_session, base_url=DASHBOARD_URL, server_id=None):
         if m:
             return m.group(1)
         # var csrfToken = '...' 或 window.csrf = '...'
-        m = re.search(r"(?:csrf|crsf|_token)\s*[:=]\s*[\"']([A-Za-z0-9_\-\.]{40,300})", text, re.I)
+        m = re.search(r"(?:csrf|crsf|_token)\s*[:=]\s*[\"']([A-Za-z0-9_\-\.%]{40,300})", text, re.I)
         if m:
             return m.group(1)
         return None
+
+    def apply_token(name, value):
+        """把 token 写回 api_session.cookies 并返回"""
+        # 不带 __Host- 前缀的 cookie, 用 .zampto.net 域; __Host- 前缀的不设 domain
+        if name.startswith("__Host-"):
+            api_session.cookies.set(name, value, path="/", domain="", secure=True)
+        else:
+            api_session.cookies.set(name, value, domain=".zampto.net", path="/")
+        log.info("  ✓ CSRF from %s (len=%d)", name, len(value))
+        return value
 
     try:
         for url in [f"{base_url}/", f"{base_url}/dashboard", f"{base_url}/api/servers"]:
@@ -177,7 +193,13 @@ def refresh_csrf_token(api_session, base_url=DASHBOARD_URL, server_id=None):
             log.info("  CSRF refresh via %s (status=%d)", url, r.status_code)
             ct = (r.headers.get("content-type") or "").lower()
 
-            # Method 1: from Set-Cookie header
+            # Method 1: requests 解析后的 r.cookies (最可靠)
+            for cn in CSRF_COOKIE_NAMES:
+                val = r.cookies.get(cn)
+                if val:
+                    return apply_token(cn, val)
+
+            # Method 2: 从 Set-Cookie header 字符串解析 (兼容旧代理/特殊场景)
             set_cookies = []
             try:
                 set_cookies = r.raw.headers.getlist("Set-Cookie")
@@ -186,30 +208,32 @@ def refresh_csrf_token(api_session, base_url=DASHBOARD_URL, server_id=None):
                     set_cookies.append(r.headers["Set-Cookie"])
             for sc in set_cookies:
                 lower_sc = sc.lower()
-                if "zampto_csrf=" in lower_sc:
-                    start = lower_sc.index("zampto_csrf=") + len("zampto_csrf=")
-                    rest = sc[start:]
-                    end = rest.find(";")
-                    token = rest[:end] if end != -1 else rest
-                    token = token.strip()
-                    if token:
-                        log.info("  ✓ CSRF from Set-Cookie (len=%d)", len(token))
-                        api_session.cookies.set("zampto_csrf", token, domain=".zampto.net", path="/")
-                        return token
+                for cn in CSRF_COOKIE_NAMES:
+                    cn_lower = cn.lower()
+                    marker = cn_lower + "="
+                    if marker in lower_sc:
+                        start = lower_sc.index(marker) + len(marker)
+                        rest = sc[start:]
+                        end = rest.find(";")
+                        token = rest[:end] if end != -1 else rest
+                        token = token.strip()
+                        if token:
+                            return apply_token(cn, token)
 
-            # Method 2: from HTML document
+            # Method 3: 从 HTML body 解析
             if "html" in ct:
                 token = extract_csrf(r.text)
                 if token:
-                    log.info("  ✓ CSRF from HTML body (len=%d)", len(token))
+                    log.info("  ✓ CSRF from HTML <meta>/JS (len=%d)", len(token))
                     api_session.cookies.set("zampto_csrf", token, domain=".zampto.net", path="/")
                     return token
 
-        # Fallback: stale token from session.cookies
-        log.warning("  No fresh CSRF from Set-Cookie or HTML, using session.cookies")
+        # Fallback: 已存在的 session.cookies (可能过期, 但值得一试)
+        log.warning("  No fresh CSRF from Set-Cookie or HTML, using existing session.cookies")
         for c in api_session.cookies:
-            if "csrf" in c.name.lower():
-                log.info("  Using stale CSRF from cookies (len=%d)", len(c.value))
+            cl = c.name.lower()
+            if "csrf" in cl or "xsrf" in cl or c.name in CSRF_COOKIE_NAMES:
+                log.info("  Using existing CSRF cookie %s (len=%d)", c.name, len(c.value))
                 return c.value
 
         log.warning("  No CSRF found anywhere")
@@ -263,19 +287,54 @@ def click_btn(page, selector):
     return False
 
 
-def solve_turnstile(page, max_wait=30):
-    """等待 Cloudflare Turnstile 验证自动通过。
+def solve_turnstile(page, max_wait=60, click_after=12):
+    """等待 Cloudflare Turnstile 验证自动通过; 若超时未通过, 用坐标点击 iframe 复选框。
 
-    用户确认: 点击 Renew 后 Turnstile 会自动通过 (无需点击 checkbox)。
-    本函数只做检测和等待, 不主动点击 (避免干扰自动验证)。
-    返回 True 表示验证已通过/无需验证, False 表示超时。
+    行为:
+      1. 检测到 Turnstile iframe (challenges.cloudflare.com) 后, 优先等待自动通过
+         (用户确认多数情况下 managed 模式会自动通过)
+      2. 若 iframe 持续存在超过 click_after 秒仍未消失, 用 page.mouse.click 坐标点击
+         iframe 内复选框位置 (左上区域约 40, 30 像素, 视 widget 大小调整)
+      3. 点击前先做随机鼠标移动 + 短停顿, 模拟真实用户行为 (避免 Cloudflare 检测自动化)
+      4. 整个流程上限 max_wait 秒
+
+    跨域 iframe JS 不能直接 click 内部元素, 但 page.mouse.click 是浏览器层面的
+    合成事件, 直接发送到 (x, y) 坐标, 不受同源策略限制, 因此可以"穿透" iframe。
+
+    返回 True 表示验证已通过/无需验证, False 表示超时仍未通过。
     """
     import time as _time
-    log.info("🎯 等待 Turnstile 自动验证通过...")
+    import random as _rand
+    log.info("🎯 等待 Turnstile 自动验证通过 (最长 %ds, %ds 后尝试坐标点击)...", max_wait, click_after)
     deadline = _time.time() + max_wait
+    iframe_first_seen = None
+    clicked_at = None
+
+    def _find_iframe_box():
+        """找到 Turnstile iframe 及其 bounding box, 找不到返回 None"""
+        try:
+            sel = 'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
+            iframe_el = page.query_selector(sel)
+            if iframe_el:
+                box = iframe_el.bounding_box()
+                if box:
+                    return iframe_el, box
+        except Exception:
+            pass
+        return None, None
+
     while _time.time() < deadline:
         try:
-            # 1. 检查页面是否出现验证提示
+            # 1. 检查是否还有 Turnstile 痕迹
+            has_frame = False
+            try:
+                for fr in page.frames:
+                    furl = (fr.url or "").lower()
+                    if "challenges.cloudflare.com" in furl or "turnstile" in furl:
+                        has_frame = True
+                        break
+            except Exception:
+                pass
             body_text = ""
             try:
                 body_text = page.evaluate("document.body ? document.body.innerText : ''") or ""
@@ -284,27 +343,58 @@ def solve_turnstile(page, max_wait=30):
             has_verify = any(w in body_text.lower() for w in
                              ["security verification", "complete the security", "verification required",
                               "loading security", "please complete"])
-            # 2. 查找 Turnstile iframe
-            has_frame = False
-            try:
-                frames = page.frames
-                for fr in frames:
-                    furl = (fr.url or "").lower()
-                    if "challenges.cloudflare.com" in furl or "turnstile" in furl:
-                        has_frame = True
-                        break
-            except Exception:
-                pass
 
+            # 2. 验证已消失 -> 通过
             if not has_verify and not has_frame:
-                log.info("  ✅ 验证已消失, Turnstile 自动通过")
+                if iframe_first_seen:
+                    log.info("  ✅ Turnstile 已通过 (耗时 %.1fs)", _time.time() - iframe_first_seen)
+                else:
+                    log.info("  ✅ 未出现 Turnstile, 无需验证")
                 return True
+
+            # 3. 记录 iframe 首次出现时间
+            if has_frame and iframe_first_seen is None:
+                iframe_first_seen = _time.time()
+                log.info("  📍 Turnstile iframe 首次出现")
+
+            # 4. 若等待已超过 click_after 秒仍未通过, 用坐标点击 iframe 复选框
+            if (has_frame and iframe_first_seen is not None
+                    and clicked_at is None
+                    and _time.time() - iframe_first_seen >= click_after):
+                iframe_el, box = _find_iframe_box()
+                if box:
+                    # checkbox 在 Turnstile widget 左上区域 (典型 widget 300x65, checkbox 约 30x30 在 x=10, y=18)
+                    # 用 page.mouse.click 而非 iframe_el.click() 因为后者在跨域 iframe 上会被同源策略拦截
+                    target_x = box['x'] + 30
+                    target_y = box['y'] + 30
+                    try:
+                        # 拟人化: 先随机移动几下, 短停顿, 再点击
+                        for _ in range(2):
+                            page.mouse.move(
+                                box['x'] + _rand.uniform(50, 200),
+                                box['y'] + _rand.uniform(20, 80),
+                            )
+                            _time.sleep(_rand.uniform(0.2, 0.5))
+                        _time.sleep(_rand.uniform(0.3, 0.8))
+                        page.mouse.click(target_x, target_y)
+                        clicked_at = _time.time()
+                        log.info("  🖱️ 已坐标点击 Turnstile checkbox (%.0f, %.0f) (iframe 大小 %.0fx%.0f)",
+                                 target_x, target_y, box['width'], box['height'])
+                    except Exception as e:
+                        log.warning("  坐标点击失败: %s", e)
+                else:
+                    log.warning("  Turnstile iframe 找不到 bounding box, 无法点击")
 
             _time.sleep(3)
         except Exception as e:
             log.warning("Turnstile 等待异常: %s", e)
             _time.sleep(2)
-    log.warning("⏰ Turnstile 自动验证超时(%ds)", max_wait)
+
+    # 超时退出
+    if clicked_at:
+        log.warning("⏰ Turnstile 已点击但 %ds 内仍未通过 (可能 widget 仍在校验)", max_wait)
+    else:
+        log.warning("⏰ Turnstile 验证超时(%ds), 未能自动通过也未尝试点击", max_wait)
     return False
 
 
@@ -365,66 +455,86 @@ def phase_browser_login_interactive():
 # ========================
 # Phase 2: 浏览器自动续期
 # ========================
-def renew_via_browser_fetch(page, sid):
+def renew_via_browser_fetch(page, sid, explicit_csrf=None):
     """在浏览器页面上下文中尝试刷新服务器。
-    CSRF token 由浏览器自动管理，无需手动刷新。"""
+    CSRF token 由浏览器自动管理，无需手动刷新。
+
+    explicit_csrf: 若提供, 则优先使用此 token (绕过 document.cookie HttpOnly 限制)。
+    浏览器 HttpOnly cookie JS 无法读取, 但 Playwright ctx.cookies() 可以,
+    调用方应在 page.evaluate 之前从 ctx.cookies() 取出 zampto_csrf 注入此处。
+    """
     import json as _json
     bodies = [
         {"server_id": sid}, {"id": sid}, {"serverId": sid},
         {"server": sid}, {"sid": sid},
     ]
-    for body in bodies:
-        try:
-            js = f"""
-(async () => {{
-    try {{
-        // 收集所有候选 CSRF token (meta 优先, 其次 cookie 各种形式)
+    # JS 函数, Playwright page.evaluate 会调用它并传入 args
+    # args = {explicit_csrf, body}; 用 args 而非闭包变量, 是因为 page.evaluate 会把
+    # 闭包变量序列化再反序列化, 但传 args 是 Playwright 原生支持的, 更可靠
+    js_fn = r"""
+async (args) => {
+    try {
         const candidates = [];
+        if (args && args.explicit_csrf) {
+            const t = String(args.explicit_csrf).trim();
+            if (t) candidates.push(t);
+        }
         const meta = document.querySelector('meta[name="csrf-token"]');
-        if (meta && meta.getAttribute('content')) candidates.push(meta.getAttribute('content').trim());
-        const cookieParts = document.cookie.split(';');
-        for (const part of cookieParts) {{
+        if (meta && meta.getAttribute('content')) {
+            const m = meta.getAttribute('content').trim();
+            if (m && !candidates.includes(m)) candidates.push(m);
+        }
+        const cookieParts = (document.cookie || '').split(';');
+        for (const part of cookieParts) {
             const kv = part.trim().split('=');
             if (kv.length < 2) continue;
             const name = kv[0].trim();
-            if (name === 'XSRF-TOKEN' || name === 'zampto_csrf' || /csrf/i.test(name)) {{
+            if (name === 'XSRF-TOKEN' || name === 'zampto_csrf' || /csrf/i.test(name)) {
                 const raw = kv.slice(1).join('=');
                 if (raw && !candidates.includes(raw)) candidates.push(raw);
-                try {{
+                try {
                     const dec = decodeURIComponent(raw);
                     if (dec && !candidates.includes(dec)) candidates.push(dec);
-                }} catch(e) {{}}
+                } catch(e) {}
                 break;
-            }}
-        }}
-        // 逐个候选 x 两种 header 名尝试
+            }
+        }
         const headerNames = ['X-XSRF-TOKEN', 'X-CSRF-TOKEN'];
-        for (const tok of candidates) {{
-            for (const hdr of headerNames) {{
-                const res = await fetch('/api/server/renew', {{
+        for (const tok of candidates) {
+            for (const hdr of headerNames) {
+                const res = await fetch('/api/server/renew', {
                     method: 'POST',
-                    headers: {{
+                    headers: {
                         'Content-Type': 'application/json',
                         [hdr]: tok,
                         'Accept': 'application/json',
                         'X-Requested-With': 'XMLHttpRequest',
-                    }},
-                    body: '{_json.dumps(body)}',
-                }});
+                    },
+                    body: JSON.stringify(args.body),
+                    credentials: 'include',
+                });
                 const text = await res.text();
                 const ok = [200, 201, 204, 202].includes(res.status);
-                if (ok) return JSON.stringify({{status: res.status, body: text, header: hdr, tokLen: tok.length, ok: true}});
-                // 非 CSRF 错误的响应: 说明 token 对了, 是业务错误(如冷却期)
-                if (res.status !== 403 || !/csrf/i.test(text)) {{
-                    return JSON.stringify({{status: res.status, body: text, header: hdr, tokLen: tok.length, ok: false, final: true}});
-                }}
-            }}
-        }}
-        return JSON.stringify({{status: -1, body: 'all csrf attempts failed', ok: false}});
-    }} catch(e) {{ return JSON.stringify({{status: 0, body: e.message, ok: false}}); }}
-}})();
+                if (ok) return JSON.stringify({status: res.status, body: text, header: hdr, tokLen: tok.length, ok: true});
+                if (res.status !== 403 || !/csrf/i.test(text)) {
+                    return JSON.stringify({status: res.status, body: text, header: hdr, tokLen: tok.length, ok: false, final: true});
+                }
+            }
+        }
+        return JSON.stringify({
+            status: -1,
+            body: 'all csrf attempts failed (candidates=' + candidates.length + ', cookie_readable=' + (document.cookie ? 'yes' : 'no') + ')',
+            ok: false,
+        });
+    } catch(e) {
+        return JSON.stringify({status: 0, body: e.message, ok: false});
+    }
+}
 """
-            result = page.evaluate(js)
+    for body in bodies:
+        try:
+            args_obj = {"explicit_csrf": explicit_csrf or "", "body": body}
+            result = page.evaluate(js_fn, args_obj)
             data = _json.loads(result)
             log.info("  fetch /api/server/renew body=%s -> HTTP %s (header=%s tokLen=%s) resp=%s",
                      body, data.get("status"), data.get("header"), data.get("tokLen"),
@@ -552,10 +662,21 @@ def phase_browser_renewal(cookies=None):
                 log.warning("  skip cookie %s: %s", c["name"], e)
 
         # 验证注入结果: 打印浏览器实际 cookie 名 (确认 XSRF-TOKEN/session 是否注入成功)
+        # 同时从 ctx.cookies() 取出 CSRF token (HttpOnly cookie JS 读不到, 但 Playwright 可以)
+        browser_csrf_token = None
         try:
             real_cookies = ctx.cookies()
             real_names = [ck["name"] for ck in real_cookies]
             log.info("📋 浏览器实际 Cookies(%d): %s", len(real_names), real_names)
+            # 找 CSRF cookie (HttpOnly 也能读到); 优先 zampto_csrf, 兜底其他名称
+            csrf_cookie_names = ["zampto_csrf", "XSRF-TOKEN", "__Host-zampto_csrf", "__Host-XSRF-TOKEN", "csrf_token", "xsrf_token"]
+            csrf_cookie = next((ck for ck in real_cookies if ck["name"] in csrf_cookie_names), None)
+            if csrf_cookie:
+                browser_csrf_token = csrf_cookie["value"]
+                log.info("🔑 浏览器 CSRF cookie %s (len=%d, httpOnly=%s) 已取出, 将注入 fetch",
+                         csrf_cookie["name"], len(browser_csrf_token), csrf_cookie.get("httpOnly"))
+            else:
+                log.warning("⚠️ 浏览器未找到 CSRF cookie (HttpOnly cookie 也读不到) - 将依赖 document.cookie")
         except Exception as e:
             log.warning("读取浏览器 cookie 失败: %s", e)
 
@@ -582,7 +703,21 @@ def phase_browser_renewal(cookies=None):
 
         # 执行续期
         sid = SERVER_ID
-        renewed, data = renew_via_browser_fetch(page, sid)
+        # 在导航到服务器页之后, 浏览器可能已用新 Set-Cookie 覆盖了注入的 CSRF cookie
+        # 重新从 ctx.cookies() 读取最新的 token, 确保 explicit_csrf 是当前最新值
+        try:
+            real_cookies2 = ctx.cookies()
+            csrf_cookie_names = ["zampto_csrf", "XSRF-TOKEN", "__Host-zampto_csrf", "__Host-XSRF-TOKEN", "csrf_token", "xsrf_token"]
+            csrf_cookie2 = next((ck for ck in real_cookies2 if ck["name"] in csrf_cookie_names), None)
+            if csrf_cookie2:
+                if browser_csrf_token != csrf_cookie2["value"]:
+                    log.info("🔄 页面加载后 CSRF cookie 已更新 (len %d -> %d), 使用最新值",
+                             len(browser_csrf_token or ""), len(csrf_cookie2["value"]))
+                browser_csrf_token = csrf_cookie2["value"]
+        except Exception as e:
+            log.warning("刷新 CSRF cookie 失败(可忽略): %s", e)
+
+        renewed, data = renew_via_browser_fetch(page, sid, explicit_csrf=browser_csrf_token)
         if renewed:
             log.info("续期成功! response: %s", data.get("body", "")[:200])
             browser.close()
@@ -624,9 +759,10 @@ def phase_browser_renewal(cookies=None):
                 page.wait_for_timeout(3000)
                 snap(page, "03_after_renew.png")
                 # 处理 Turnstile 安全验证 (Zampto 续期需要人机验证)
-                turnstile_ok = solve_turnstile(page, max_wait=40)
+                # 新版 solve_turnstile: 先等 12s 自动通过, 未通过则坐标点击 iframe checkbox
+                turnstile_ok = solve_turnstile(page, max_wait=60, click_after=12)
                 if not turnstile_ok:
-                    log.warning("Turnstile 未自动通过, 尝试继续等待后验证")
+                    log.warning("Turnstile 60s 内未通过 (已尝试坐标点击), 继续验证 renewal 变化...")
                 page.wait_for_timeout(3000)
                 snap(page, "04_after_verify.png")
                 log.info("按钮点击完成, 等待 3s 后验证续期结果...")
@@ -959,17 +1095,28 @@ def phase_api_renewal(use_cookies=None):
                         if not fresh_csrf:
                             continue
                         try:
-                            # Laravel 机制: zampto_csrf cookie 值是加密+URL编码的 token,
-                            # 需 URL 解码后放进 X-XSRF-TOKEN header (后端会自动解密)
-                            # X-CSRF-Token 传原始值/解码值作为备选
+                            # Laravel 机制: zampto_csrf cookie 值是加密+URL编码的 token。
+                            # - 浏览器存的是已 URL-decode 的值 (Playwright 会自动 decode)
+                            # - requests 的 session.cookies 通常保留原始 (可能 URL-encoded) 形式
+                            # - Laravel VerifyCsrfToken 会对 X-XSRF-TOKEN 调用 rawurldecode,
+                            #   再 decrypt; 对 X-CSRF-Token 则期望明文 token (我们解不出)
+                            # 因此我们尝试三种形式: 原始 / URL-encoded (safe='') / URL-decoded,
+                            # 覆盖各种可能的 cookie 存储形式, Laravel 至少有一种能成功 decrypt
                             import urllib.parse as _up
                             token_variants = [fresh_csrf]
+                            try:
+                                enc = _up.quote(fresh_csrf, safe='')
+                                if enc and enc != fresh_csrf:
+                                    token_variants.append(enc)
+                            except Exception:
+                                pass
                             try:
                                 dec = _up.unquote(fresh_csrf)
                                 if dec and dec != fresh_csrf:
                                     token_variants.append(dec)
                             except Exception:
                                 pass
+                            # X-XSRF-TOKEN 是 Laravel 标准 header, X-CSRF-Token 备选
                             header_variants = ["X-XSRF-TOKEN", "X-CSRF-Token"]
                             renew_success = False
                             for hdr in header_variants:
@@ -983,9 +1130,10 @@ def phase_api_renewal(use_cookies=None):
                                         )
                                         ct = resp.headers.get("content-type", "")
                                         is_json = "json" in ct.lower()
-                                        log.info("    -> %d %s body=%s [%s len=%d]",
+                                        log.info("    -> %d %s body=%s [%s len=%d variant=%s]",
                                                  resp.status_code, "JSON" if is_json else "HTML",
-                                                 resp.text[:200], hdr, len(tok))
+                                                 resp.text[:200], hdr, len(tok),
+                                                 "raw" if tok == fresh_csrf else ("enc" if tok == _up.quote(fresh_csrf, safe='') else "dec"))
 
                                         if resp.status_code in [200, 201, 204, 202]:
                                             report["action"] = "renewed"
