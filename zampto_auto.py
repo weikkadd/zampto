@@ -1659,37 +1659,49 @@ def main():
 
     if status == "renewed":
         log.info("✓ 续期成功")
-        push_tg("🖥️ Zampto 服务器报告",
-            f"**服务器 ID:** `{SERVER_ID}`\n"
-            f"**状态:** 🟢 运行中\n"
-            f"**操作:** 🔄 已续期"
-            + (f"\n**到期:** {expiry_str}" if expiry_str else "") + "\n"
-            f"\n*浏览器自动续期完成*")
-        sys.exit(0)
+        try:
+            push_tg("🖥️ Zampto 服务器报告",
+                f"**服务器 ID:** `{SERVER_ID}`\n"
+                f"**状态:** 🟢 运行中\n"
+                f"**操作:** 🔄 已续期"
+                + (f"\n**到期:** {expiry_str}" if expiry_str else "") + "\n"
+                f"\n*浏览器自动续期完成*")
+        except Exception as e:
+            log.warning("TG 通知失败(忽略): %s", e)
+        # 用 os._exit 替代 sys.exit: sys.exit 触发 SystemExit 异常, 在 Playwright/
+        # CloakBrowser 的 event loop 中可能被替换为非 0 退出码导致 workflow 显示失败
+        # (续期其实已成功, 仅退出码问题). os._exit 跳过 finalizer, 直接退出 0
+        os._exit(0)
     elif status == "skipped":
         log.info("⏭️ 剩余时间充足, 跳过续期")
-        push_tg("🖥️ Zampto 服务器报告",
-            f"**服务器 ID:** `{SERVER_ID}`\n"
-            f"**状态:** 🟢 运行中\n"
-            f"**操作:** ⏭️ 已跳过"
-            + (f"\n**到期:** {expiry_str}" if expiry_str else "") + "\n"
-            f"\n*剩余时间充足, 无需续期*")
-        sys.exit(0)
+        try:
+            push_tg("🖥️ Zampto 服务器报告",
+                f"**服务器 ID:** `{SERVER_ID}`\n"
+                f"**状态:** 🟢 运行中\n"
+                f"**操作:** ⏭️ 已跳过"
+                + (f"\n**到期:** {expiry_str}" if expiry_str else "") + "\n"
+                f"\n*剩余时间充足, 无需续期*")
+        except Exception as e:
+            log.warning("TG 通知失败(忽略): %s", e)
+        os._exit(0)
 
     # 浏览器未成功(failed): 尝试 API 模式 (可能 CSRF 失败, 但值得一试)
     log.info("浏览器续期未成功(%s), 尝试 API 模式...", status)
     api_ok = phase_api_renewal(use_cookies=cookies)
     if api_ok:
         log.info("✅ API 续期流程完成 (报告已通过 API 路径推送)")
-        sys.exit(0)
+        os._exit(0)
 
     # 两种方式都失败
     log.error("❌ 浏览器和 API 续期均失败")
-    push_tg("🖥️ Zampto 服务器报告",
-        f"**服务器 ID:** `{SERVER_ID}`\n"
-        f"**状态:** 🔴 失败\n"
-        f"**错误:** 浏览器和 API 续期均失败")
-    sys.exit(1)
+    try:
+        push_tg("🖥️ Zampto 服务器报告",
+            f"**服务器 ID:** `{SERVER_ID}`\n"
+            f"**状态:** 🔴 失败\n"
+            f"**错误:** 浏览器和 API 续期均失败")
+    except Exception as e:
+        log.warning("TG 通知失败(忽略): %s", e)
+    os._exit(1)
 
 
 if __name__ == "__main__":
