@@ -309,19 +309,116 @@ def solve_turnstile(page, max_wait=60, click_after=12):
     deadline = _time.time() + max_wait
     iframe_first_seen = None
     clicked_at = None
+    last_diag_dump = 0  # 限流: 每 9s 才 dump 一次诊断, 避免日志爆炸
 
     def _find_iframe_box():
-        """找到 Turnstile iframe 及其 bounding box, 找不到返回 None"""
+        """找到 Turnstile iframe 及其 bounding box, 找不到返回 None
+
+        多策略查找 (按可靠性排序):
+          A. 遍历 page.frames 找到 CF Turnstile frame, 用 frame.frame_element() 拿到
+             iframe DOM 元素 (最可靠, 不依赖 src 属性匹配)
+          B. query_selector 多种 src 选择器 (兜底, 兼容属性 src 与动态 src)
+          C. 用 page.evaluate 在页面内遍历所有 iframe, 返回 boundingClientRect (最深入)
+        """
+        # 策略 A: 从 page.frames 反查 iframe DOM 元素
         try:
-            sel = 'iframe[src*="challenges.cloudflare.com"], iframe[src*="turnstile"]'
-            iframe_el = page.query_selector(sel)
-            if iframe_el:
-                box = iframe_el.bounding_box()
-                if box:
-                    return iframe_el, box
+            for fr in page.frames:
+                furl = (fr.url or "").lower()
+                if "challenges.cloudflare.com" in furl or "turnstile" in furl:
+                    try:
+                        iframe_el = fr.frame_element()
+                        if iframe_el:
+                            box = iframe_el.bounding_box()
+                            if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+                                return iframe_el, box
+                    except Exception:
+                        pass
         except Exception:
             pass
+
+        # 策略 B: query_selector 多选择器
+        for sel in [
+            'iframe[src*="challenges.cloudflare.com"]',
+            'iframe[src*="turnstile"]',
+            'iframe[src*="cloudflare"]',
+            'div.cf-turnstile iframe',
+            'div[data-sitekey] iframe',
+            'iframe[title*="Widget"]',
+        ]:
+            try:
+                iframe_el = page.query_selector(sel)
+                if iframe_el:
+                    box = iframe_el.bounding_box()
+                    if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+                        return iframe_el, box
+            except Exception:
+                pass
+
+        # 策略 C: 在页面内用 JS 遍历所有 iframe, 拿 boundingClientRect
+        try:
+            js_get_box = """
+            (() => {
+                const iframes = document.querySelectorAll('iframe');
+                const results = [];
+                for (const ifr of iframes) {
+                    const r = ifr.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) {
+                        results.push({
+                            src: ifr.src || ifr.getAttribute('src') || '',
+                            title: ifr.title || '',
+                            x: r.left, y: r.top, w: r.width, h: r.height,
+                        });
+                    }
+                }
+                return JSON.stringify(results);
+            })();
+"""
+            result = page.evaluate(js_get_box)
+            import json as _ij
+            iframe_list = _ij.loads(result) if result else []
+            for ifr in iframe_list:
+                src = (ifr.get("src") or "").lower()
+                title = (ifr.get("title") or "").lower()
+                if "challenges.cloudflare.com" in src or "turnstile" in src or "widget" in title or "turnstile" in title:
+                    return None, {
+                        "x": ifr["x"], "y": ifr["y"],
+                        "width": ifr["w"], "height": ifr["h"],
+                    }
+        except Exception:
+            pass
+
         return None, None
+
+    def _dump_diag():
+        """诊断: 打印当前页面所有 iframe 信息, 帮助定位为何找不到 bounding box"""
+        try:
+            diag = page.evaluate("""
+            (() => {
+                const iframes = document.querySelectorAll('iframe');
+                const out = [];
+                for (const ifr of iframes) {
+                    const r = ifr.getBoundingClientRect();
+                    out.push({
+                        src: (ifr.src || '').slice(0, 100),
+                        title: ifr.title || '',
+                        visible: ifr.offsetParent !== null,
+                        w: Math.round(r.width), h: Math.round(r.height),
+                        x: Math.round(r.left), y: Math.round(r.top),
+                    });
+                }
+                // 同时检查 cf-turnstile 容器
+                const cf = document.querySelector('.cf-turnstile, [data-sitekey]');
+                const cfInfo = cf ? {
+                    tag: cf.tagName, className: cf.className,
+                    visible: cf.offsetParent !== null,
+                    rect: cf.getBoundingClientRect().toJSON(),
+                } : null;
+                return JSON.stringify({iframes: out, cfContainer: cfInfo});
+            })();
+""")
+            log.info("  [DIAG] %s", diag[:500])
+        except Exception as e:
+            log.warning("  [DIAG] 失败: %s", e)
 
     while _time.time() < deadline:
         try:
@@ -356,6 +453,7 @@ def solve_turnstile(page, max_wait=60, click_after=12):
             if has_frame and iframe_first_seen is None:
                 iframe_first_seen = _time.time()
                 log.info("  📍 Turnstile iframe 首次出现")
+                _dump_diag()
 
             # 4. 若等待已超过 click_after 秒仍未通过, 用坐标点击 iframe 复选框
             if (has_frame and iframe_first_seen is not None
@@ -363,16 +461,20 @@ def solve_turnstile(page, max_wait=60, click_after=12):
                     and _time.time() - iframe_first_seen >= click_after):
                 iframe_el, box = _find_iframe_box()
                 if box:
-                    # checkbox 在 Turnstile widget 左上区域 (典型 widget 300x65, checkbox 约 30x30 在 x=10, y=18)
+                    # checkbox 在 Turnstile widget 左上区域
+                    # 典型 widget 300x65, checkbox 约 30x30 在 x=10, y=18
                     # 用 page.mouse.click 而非 iframe_el.click() 因为后者在跨域 iframe 上会被同源策略拦截
-                    target_x = box['x'] + 30
-                    target_y = box['y'] + 30
+                    # 点击坐标 = iframe 左上角 + 偏移 (取 widget 高度的 ~40%, 宽度的 ~10%)
+                    offset_x = max(30, box['width'] * 0.10)
+                    offset_y = box['height'] * 0.40
+                    target_x = box['x'] + offset_x
+                    target_y = box['y'] + offset_y
                     try:
                         # 拟人化: 先随机移动几下, 短停顿, 再点击
                         for _ in range(2):
                             page.mouse.move(
-                                box['x'] + _rand.uniform(50, 200),
-                                box['y'] + _rand.uniform(20, 80),
+                                box['x'] + _rand.uniform(50, max(100, box['width'])),
+                                box['y'] + _rand.uniform(20, max(40, box['height'])),
                             )
                             _time.sleep(_rand.uniform(0.2, 0.5))
                         _time.sleep(_rand.uniform(0.3, 0.8))
@@ -383,7 +485,11 @@ def solve_turnstile(page, max_wait=60, click_after=12):
                     except Exception as e:
                         log.warning("  坐标点击失败: %s", e)
                 else:
-                    log.warning("  Turnstile iframe 找不到 bounding box, 无法点击")
+                    # 限流诊断, 避免日志爆炸
+                    if _time.time() - last_diag_dump > 9:
+                        log.warning("  Turnstile iframe 找不到 bounding box, 无法点击 (尝试多种选择器均失败)")
+                        _dump_diag()
+                        last_diag_dump = _time.time()
 
             _time.sleep(3)
         except Exception as e:
@@ -500,8 +606,16 @@ async (args) => {
             }
         }
         const headerNames = ['X-XSRF-TOKEN', 'X-CSRF-TOKEN'];
+        let lastTokHdr = null;
+        let lastTokPrefix = null;
+        let lastRespBody = null;
+        let lastStatus = null;
+        let attempts = 0;
         for (const tok of candidates) {
             for (const hdr of headerNames) {
+                attempts++;
+                lastTokHdr = hdr;
+                lastTokPrefix = tok.slice(0, 50);
                 const res = await fetch('/api/server/renew', {
                     method: 'POST',
                     headers: {
@@ -514,6 +628,8 @@ async (args) => {
                     credentials: 'include',
                 });
                 const text = await res.text();
+                lastStatus = res.status;
+                lastRespBody = text.slice(0, 200);
                 const ok = [200, 201, 204, 202].includes(res.status);
                 if (ok) return JSON.stringify({status: res.status, body: text, header: hdr, tokLen: tok.length, ok: true});
                 if (res.status !== 403 || !/csrf/i.test(text)) {
@@ -523,8 +639,15 @@ async (args) => {
         }
         return JSON.stringify({
             status: -1,
-            body: 'all csrf attempts failed (candidates=' + candidates.length + ', cookie_readable=' + (document.cookie ? 'yes' : 'no') + ')',
+            body: 'all csrf attempts failed',
             ok: false,
+            attempts: attempts,
+            candidates: candidates.length,
+            cookie_readable: document.cookie ? 'yes' : 'no',
+            lastTokHdr: lastTokHdr,
+            lastTokPrefix: lastTokPrefix,
+            lastStatus: lastStatus,
+            lastRespBody: lastRespBody,
         });
     } catch(e) {
         return JSON.stringify({status: 0, body: e.message, ok: false});
@@ -536,9 +659,18 @@ async (args) => {
             args_obj = {"explicit_csrf": explicit_csrf or "", "body": body}
             result = page.evaluate(js_fn, args_obj)
             data = _json.loads(result)
-            log.info("  fetch /api/server/renew body=%s -> HTTP %s (header=%s tokLen=%s) resp=%s",
-                     body, data.get("status"), data.get("header"), data.get("tokLen"),
-                     str(data.get("body", ""))[:200])
+            if data.get("status") == -1:
+                # 详细日志: 报告最后尝试的 header / token 前缀 / 响应体
+                log.info("  fetch /api/server/renew body=%s -> HTTP -1 resp=%s",
+                         body, str(data.get("body", ""))[:200])
+                log.info("    [DIAG] attempts=%s candidates=%s cookie_readable=%s lastTokHdr=%s lastTokPrefix=%r lastStatus=%s lastRespBody=%s",
+                         data.get("attempts"), data.get("candidates"), data.get("cookie_readable"),
+                         data.get("lastTokHdr"), data.get("lastTokPrefix"),
+                         data.get("lastStatus"), str(data.get("lastRespBody", ""))[:150])
+            else:
+                log.info("  fetch /api/server/renew body=%s -> HTTP %s (header=%s tokLen=%s) resp=%s",
+                         body, data.get("status"), data.get("header"), data.get("tokLen"),
+                         str(data.get("body", ""))[:200])
             if data.get("status") in (200, 201, 204, 202):
                 return True, data
             # 非 403 或业务错误: 说明 CSRF 已通过, 继续试其他 body 无意义
@@ -1094,6 +1226,11 @@ def phase_api_renewal(use_cookies=None):
                         fresh_csrf = refresh_csrf_token(api_session)
                         if not fresh_csrf:
                             continue
+                        # 首个 body: 打印 CSRF 前缀 + 现有 session cookies 名, 帮助诊断
+                        if body is body_variants[0]:
+                            log.info("  [DIAG] csrf_token prefix=%r len=%d, session cookies=%s",
+                                     fresh_csrf[:50], len(fresh_csrf),
+                                     [(c.name, len(c.value), c.domain) for c in api_session.cookies])
                         try:
                             # Laravel 机制: zampto_csrf cookie 值是加密+URL编码的 token。
                             # - 浏览器存的是已 URL-decode 的值 (Playwright 会自动 decode)
@@ -1116,6 +1253,23 @@ def phase_api_renewal(use_cookies=None):
                                     token_variants.append(dec)
                             except Exception:
                                 pass
+                            # 兜底: 把 token 末尾的 = 去掉 / 加上一个 =, 模拟 base64 padding 差异
+                            try:
+                                if fresh_csrf.endswith("="):
+                                    pad_stripped = fresh_csrf.rstrip("=")
+                                    if pad_stripped not in token_variants:
+                                        token_variants.append(pad_stripped)
+                                else:
+                                    # 长度不是 4 的倍数时补 =
+                                    rem = len(fresh_csrf) % 4
+                                    if rem:
+                                        pad_added = fresh_csrf + "=" * (4 - rem)
+                                        if pad_added not in token_variants:
+                                            token_variants.append(pad_added)
+                            except Exception:
+                                pass
+                            if body is body_variants[0]:
+                                log.info("  [DIAG] token_variants=%d (raw/enc/dec/pad)", len(token_variants))
                             # X-XSRF-TOKEN 是 Laravel 标准 header, X-CSRF-Token 备选
                             header_variants = ["X-XSRF-TOKEN", "X-CSRF-Token"]
                             renew_success = False
@@ -1130,10 +1284,20 @@ def phase_api_renewal(use_cookies=None):
                                         )
                                         ct = resp.headers.get("content-type", "")
                                         is_json = "json" in ct.lower()
+                                        # variant 标签: raw / enc / dec / pad_stripped / pad_added
+                                        if tok == fresh_csrf:
+                                            vtag = "raw"
+                                        elif tok == _up.quote(fresh_csrf, safe=''):
+                                            vtag = "enc"
+                                        elif tok == _up.unquote(fresh_csrf):
+                                            vtag = "dec"
+                                        elif fresh_csrf.endswith("=") and tok == fresh_csrf.rstrip("="):
+                                            vtag = "pad_stripped"
+                                        else:
+                                            vtag = "pad_added"
                                         log.info("    -> %d %s body=%s [%s len=%d variant=%s]",
                                                  resp.status_code, "JSON" if is_json else "HTML",
-                                                 resp.text[:200], hdr, len(tok),
-                                                 "raw" if tok == fresh_csrf else ("enc" if tok == _up.quote(fresh_csrf, safe='') else "dec"))
+                                                 resp.text[:200], hdr, len(tok), vtag)
 
                                         if resp.status_code in [200, 201, 204, 202]:
                                             report["action"] = "renewed"
