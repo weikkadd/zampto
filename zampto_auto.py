@@ -287,16 +287,17 @@ def click_btn(page, selector):
     return False
 
 
-def solve_turnstile(page, max_wait=60, click_after=12):
+def solve_turnstile(page, max_wait=90, click_after=8):
     """等待 Cloudflare Turnstile 验证自动通过; 若超时未通过, 用坐标点击 iframe 复选框。
 
     行为:
       1. 检测到 Turnstile iframe (challenges.cloudflare.com) 后, 优先等待自动通过
          (用户确认多数情况下 managed 模式会自动通过)
       2. 若 iframe 持续存在超过 click_after 秒仍未消失, 用 page.mouse.click 坐标点击
-         iframe 内复选框位置 (左上区域约 40, 30 像素, 视 widget 大小调整)
+         iframe 内复选框位置 (左上区域)
       3. 点击前先做随机鼠标移动 + 短停顿, 模拟真实用户行为 (避免 Cloudflare 检测自动化)
-      4. 整个流程上限 max_wait 秒
+      4. 如果第一次坐标点击后 iframe 仍在 15s 内未消失, 再点击一次 (改用不同 offset)
+      5. 整个流程上限 max_wait 秒
 
     跨域 iframe JS 不能直接 click 内部元素, 但 page.mouse.click 是浏览器层面的
     合成事件, 直接发送到 (x, y) 坐标, 不受同源策略限制, 因此可以"穿透" iframe。
@@ -308,8 +309,10 @@ def solve_turnstile(page, max_wait=60, click_after=12):
     log.info("🎯 等待 Turnstile 自动验证通过 (最长 %ds, %ds 后尝试坐标点击)...", max_wait, click_after)
     deadline = _time.time() + max_wait
     iframe_first_seen = None
-    clicked_at = None
-    last_diag_dump = 0  # 限流: 每 9s 才 dump 一次诊断, 避免日志爆炸
+    last_click_at = None
+    click_count = 0
+    last_diag_dump = 0  # 限流: 每 15s 才 dump 一次诊断, 避免日志爆炸
+    iframe_ready_logged = False
 
     def _find_iframe_box():
         """找到 Turnstile iframe 及其 bounding box, 找不到返回 None
@@ -344,6 +347,7 @@ def solve_turnstile(page, max_wait=60, click_after=12):
             'div.cf-turnstile iframe',
             'div[data-sitekey] iframe',
             'iframe[title*="Widget"]',
+            'iframe[title*="Cloudflare"]',
         ]:
             try:
                 iframe_el = page.query_selector(sel)
@@ -362,13 +366,13 @@ def solve_turnstile(page, max_wait=60, click_after=12):
                 const results = [];
                 for (const ifr of iframes) {
                     const r = ifr.getBoundingClientRect();
-                    if (r.width > 0 && r.height > 0) {
-                        results.push({
-                            src: ifr.src || ifr.getAttribute('src') || '',
-                            title: ifr.title || '',
-                            x: r.left, y: r.top, w: r.width, h: r.height,
-                        });
-                    }
+                    results.push({
+                        src: ifr.src || ifr.getAttribute('src') || '',
+                        title: ifr.title || '',
+                        visible: ifr.offsetParent !== null || ifr.getClientRects().length > 0,
+                        w: Math.round(r.width), h: Math.round(r.height),
+                        x: Math.round(r.left), y: Math.round(r.top),
+                    });
                 }
                 return JSON.stringify(results);
             })();
@@ -376,14 +380,33 @@ def solve_turnstile(page, max_wait=60, click_after=12):
             result = page.evaluate(js_get_box)
             import json as _ij
             iframe_list = _ij.loads(result) if result else []
+            # 优先返回 cf-turnstile 容器 (可能 iframe 还没加载但容器有位置)
             for ifr in iframe_list:
                 src = (ifr.get("src") or "").lower()
                 title = (ifr.get("title") or "").lower()
-                if "challenges.cloudflare.com" in src or "turnstile" in src or "widget" in title or "turnstile" in title:
+                if (("challenges.cloudflare.com" in src or "turnstile" in src or
+                     "widget" in title or "turnstile" in title or "cloudflare" in title)
+                        and ifr.get("w", 0) > 0 and ifr.get("h", 0) > 0):
                     return None, {
                         "x": ifr["x"], "y": ifr["y"],
                         "width": ifr["w"], "height": ifr["h"],
                     }
+            # cf-turnstile 容器即使 iframe 还没加载, 也可作为 fallback 点击点
+            try:
+                cf_box = page.evaluate("""
+                (() => {
+                    const cf = document.querySelector('.cf-turnstile, [data-sitekey]');
+                    if (!cf) return null;
+                    const r = cf.getBoundingClientRect();
+                    if (r.width <= 0 || r.height <= 0) return null;
+                    return JSON.stringify({x: r.left, y: r.top, w: r.width, h: r.height});
+                })();
+""")
+                if cf_box:
+                    box = _ij.loads(cf_box)
+                    return None, {"x": box["x"], "y": box["y"], "width": box["w"], "height": box["h"]}
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -406,7 +429,6 @@ def solve_turnstile(page, max_wait=60, click_after=12):
                         x: Math.round(r.left), y: Math.round(r.top),
                     });
                 }
-                // 同时检查 cf-turnstile 容器
                 const cf = document.querySelector('.cf-turnstile, [data-sitekey]');
                 const cfInfo = cf ? {
                     tag: cf.tagName, className: cf.className,
@@ -416,7 +438,7 @@ def solve_turnstile(page, max_wait=60, click_after=12):
                 return JSON.stringify({iframes: out, cfContainer: cfInfo});
             })();
 """)
-            log.info("  [DIAG] %s", diag[:500])
+            log.info("  [DIAG] %s", diag[:600])
         except Exception as e:
             log.warning("  [DIAG] 失败: %s", e)
 
@@ -449,26 +471,33 @@ def solve_turnstile(page, max_wait=60, click_after=12):
                     log.info("  ✅ 未出现 Turnstile, 无需验证")
                 return True
 
-            # 3. 记录 iframe 首次出现时间
+            # 3. 记录 iframe 首次出现时间 (但不立即 dump, 等 iframe 加载好)
             if has_frame and iframe_first_seen is None:
                 iframe_first_seen = _time.time()
                 log.info("  📍 Turnstile iframe 首次出现")
+
+            # 3.5 等待 iframe 真正有尺寸 (3s 后再 dump 一次诊断, 此时 iframe 应已加载 src)
+            if (has_frame and not iframe_ready_logged
+                    and _time.time() - iframe_first_seen >= 3):
+                iframe_ready_logged = True
                 _dump_diag()
 
             # 4. 若等待已超过 click_after 秒仍未通过, 用坐标点击 iframe 复选框
             if (has_frame and iframe_first_seen is not None
-                    and clicked_at is None
                     and _time.time() - iframe_first_seen >= click_after):
                 iframe_el, box = _find_iframe_box()
                 if box:
                     # checkbox 在 Turnstile widget 左上区域
-                    # 典型 widget 300x65, checkbox 约 30x30 在 x=10, y=18
-                    # 用 page.mouse.click 而非 iframe_el.click() 因为后者在跨域 iframe 上会被同源策略拦截
-                    # 点击坐标 = iframe 左上角 + 偏移 (取 widget 高度的 ~40%, 宽度的 ~10%)
-                    offset_x = max(30, box['width'] * 0.10)
-                    offset_y = box['height'] * 0.40
-                    target_x = box['x'] + offset_x
-                    target_y = box['y'] + offset_y
+                    # 典型 widget 300x65 (compact) 或 130x120 (block), checkbox 约 30x30 在 x=10, y=18
+                    # 多次点击尝试不同 offset, 找到正确的复选框位置
+                    click_offsets = [
+                        (max(20, box['width'] * 0.08), box['height'] * 0.30),  # 最左上, compact widget checkbox
+                        (max(30, box['width'] * 0.10), box['height'] * 0.40),  # 标准位置
+                        (max(15, box['width'] * 0.05), box['height'] * 0.25),  # 更左上
+                    ]
+                    off = click_offsets[click_count % len(click_offsets)]
+                    target_x = box['x'] + off[0]
+                    target_y = box['y'] + off[1]
                     try:
                         # 拟人化: 先随机移动几下, 短停顿, 再点击
                         for _ in range(2):
@@ -479,15 +508,20 @@ def solve_turnstile(page, max_wait=60, click_after=12):
                             _time.sleep(_rand.uniform(0.2, 0.5))
                         _time.sleep(_rand.uniform(0.3, 0.8))
                         page.mouse.click(target_x, target_y)
-                        clicked_at = _time.time()
-                        log.info("  🖱️ 已坐标点击 Turnstile checkbox (%.0f, %.0f) (iframe 大小 %.0fx%.0f)",
-                                 target_x, target_y, box['width'], box['height'])
+                        last_click_at = _time.time()
+                        click_count += 1
+                        log.info("  🖱️ 第 %d 次坐标点击 Turnstile checkbox (%.0f, %.0f) (iframe 大小 %.0fx%.0f offset %.2f,%.2f)",
+                                 click_count, target_x, target_y, box['width'], box['height'], off[0], off[1])
                     except Exception as e:
                         log.warning("  坐标点击失败: %s", e)
+                    # 第一次点击后等 15s 再决定是否重试, 避免太快连续点击被 CF 检测为自动化
+                    if click_count == 1:
+                        _time.sleep(15)
+                        continue
                 else:
                     # 限流诊断, 避免日志爆炸
-                    if _time.time() - last_diag_dump > 9:
-                        log.warning("  Turnstile iframe 找不到 bounding box, 无法点击 (尝试多种选择器均失败)")
+                    if _time.time() - last_diag_dump > 15:
+                        log.warning("  Turnstile iframe 找不到 bounding box (尝试多策略均失败)")
                         _dump_diag()
                         last_diag_dump = _time.time()
 
@@ -497,8 +531,8 @@ def solve_turnstile(page, max_wait=60, click_after=12):
             _time.sleep(2)
 
     # 超时退出
-    if clicked_at:
-        log.warning("⏰ Turnstile 已点击但 %ds 内仍未通过 (可能 widget 仍在校验)", max_wait)
+    if last_click_at:
+        log.warning("⏰ Turnstile 已点击 %d 次但 %ds 内仍未通过", click_count, max_wait)
     else:
         log.warning("⏰ Turnstile 验证超时(%ds), 未能自动通过也未尝试点击", max_wait)
     return False
@@ -563,11 +597,20 @@ def phase_browser_login_interactive():
 # ========================
 def renew_via_browser_fetch(page, sid, explicit_csrf=None):
     """在浏览器页面上下文中尝试刷新服务器。
+
     CSRF token 由浏览器自动管理，无需手动刷新。
 
     explicit_csrf: 若提供, 则优先使用此 token (绕过 document.cookie HttpOnly 限制)。
     浏览器 HttpOnly cookie JS 无法读取, 但 Playwright ctx.cookies() 可以,
     调用方应在 page.evaluate 之前从 ctx.cookies() 取出 zampto_csrf 注入此处。
+
+    本次改进 (v3):
+      - 不只试 explicit_csrf / meta / document.cookie, 还从 window 全局对象找
+        Laravel app 常见位置: window.csrfToken, window.Laravel.csrfToken,
+        window.axios.defaults.headers, document.querySelector('script[data-csrf]'),
+        以及页面 JS 渲染的 Renew 按钮 onclick 中可能硬编码的 token
+      - 详细诊断: 失败时打印 lastTokPrefix, attempts, lastStatus, lastRespBody,
+        以及所有尝试过的 candidate prefixes
     """
     import json as _json
     bodies = [
@@ -581,15 +624,52 @@ def renew_via_browser_fetch(page, sid, explicit_csrf=None):
 async (args) => {
     try {
         const candidates = [];
+
+        // 1. 显式传入的 explicit_csrf (来自 Playwright ctx.cookies() 取出的 HttpOnly cookie)
         if (args && args.explicit_csrf) {
             const t = String(args.explicit_csrf).trim();
-            if (t) candidates.push(t);
+            if (t) candidates.push({tok: t, src: 'explicit_csrf'});
         }
+
+        // 2. meta[name="csrf-token"] (Laravel 标准)
         const meta = document.querySelector('meta[name="csrf-token"]');
         if (meta && meta.getAttribute('content')) {
             const m = meta.getAttribute('content').trim();
-            if (m && !candidates.includes(m)) candidates.push(m);
+            if (m) candidates.push({tok: m, src: 'meta'});
         }
+        // meta[name="csrf_token"] (有些项目用下划线)
+        const meta2 = document.querySelector('meta[name="csrf_token"], meta[name="xsrf-token"]');
+        if (meta2 && meta2.getAttribute('content')) {
+            const m = meta2.getAttribute('content').trim();
+            if (m) candidates.push({tok: m, src: 'meta_underscore'});
+        }
+
+        // 3. window 全局对象中找 CSRF token
+        // Laravel 项目常见的全局: window.csrfToken, window.Laravel.csrfToken,
+        // window.axios.defaults.headers.common['X-XSRF-TOKEN'], window.csrf
+        try {
+            if (window.csrfToken) candidates.push({tok: String(window.csrfToken).trim(), src: 'window.csrfToken'});
+            if (window.Laravel && window.Laravel.csrfToken) candidates.push({tok: String(window.Laravel.csrfToken).trim(), src: 'window.Laravel.csrfToken'});
+            if (window.csrf) candidates.push({tok: String(window.csrf).trim(), src: 'window.csrf'});
+            if (window.axios && window.axios.defaults && window.axios.defaults.headers) {
+                const h = window.axios.defaults.headers;
+                const c = h.common || {};
+                if (c['X-XSRF-TOKEN']) candidates.push({tok: String(c['X-XSRF-TOKEN']).trim(), src: 'axios.common.X-XSRF-TOKEN'});
+                if (c['X-CSRF-TOKEN']) candidates.push({tok: String(c['X-CSRF-TOKEN']).trim(), src: 'axios.common.X-CSRF-TOKEN'});
+                if (c['X-CSRF-Token']) candidates.push({tok: String(c['X-CSRF-Token']).trim(), src: 'axios.common.X-CSRF-Token'});
+            }
+        } catch(e) {}
+
+        // 4. <script data-csrf="..." /> 形式 (Laravel Breeze / Jetstream 常见)
+        try {
+            const sc = document.querySelector('script[data-csrf], script[data-csrf-token]');
+            if (sc) {
+                const t = sc.getAttribute('data-csrf') || sc.getAttribute('data-csrf-token');
+                if (t) candidates.push({tok: t.trim(), src: 'script[data-csrf]'});
+            }
+        } catch(e) {}
+
+        // 5. document.cookie 中的 CSRF cookie (HttpOnly 读不到, 但有时不是 HttpOnly)
         const cookieParts = (document.cookie || '').split(';');
         for (const part of cookieParts) {
             const kv = part.trim().split('=');
@@ -597,25 +677,39 @@ async (args) => {
             const name = kv[0].trim();
             if (name === 'XSRF-TOKEN' || name === 'zampto_csrf' || /csrf/i.test(name)) {
                 const raw = kv.slice(1).join('=');
-                if (raw && !candidates.includes(raw)) candidates.push(raw);
+                if (raw) candidates.push({tok: raw, src: 'cookie.' + name});
                 try {
                     const dec = decodeURIComponent(raw);
-                    if (dec && !candidates.includes(dec)) candidates.push(dec);
+                    if (dec && dec !== raw) candidates.push({tok: dec, src: 'cookie.' + name + '.decoded'});
                 } catch(e) {}
                 break;
             }
         }
-        const headerNames = ['X-XSRF-TOKEN', 'X-CSRF-TOKEN'];
+
+        // 去重 (按 tok 值), 保留首次 src 标记
+        const seen = new Set();
+        const uniq = [];
+        for (const c of candidates) {
+            if (!seen.has(c.tok)) { seen.add(c.tok); uniq.push(c); }
+        }
+
+        // 报告所有 candidate 来源, 方便诊断
+        const candSummary = uniq.map(c => c.src + ':' + c.tok.slice(0, 20)).join('|');
+
+        const headerNames = ['X-XSRF-TOKEN', 'X-CSRF-TOKEN', 'X-CSRF-Token'];
         let lastTokHdr = null;
         let lastTokPrefix = null;
+        let lastTokSrc = null;
         let lastRespBody = null;
         let lastStatus = null;
         let attempts = 0;
-        for (const tok of candidates) {
+        for (const c of uniq) {
+            const tok = c.tok;
             for (const hdr of headerNames) {
                 attempts++;
                 lastTokHdr = hdr;
                 lastTokPrefix = tok.slice(0, 50);
+                lastTokSrc = c.src;
                 const res = await fetch('/api/server/renew', {
                     method: 'POST',
                     headers: {
@@ -631,9 +725,9 @@ async (args) => {
                 lastStatus = res.status;
                 lastRespBody = text.slice(0, 200);
                 const ok = [200, 201, 204, 202].includes(res.status);
-                if (ok) return JSON.stringify({status: res.status, body: text, header: hdr, tokLen: tok.length, ok: true});
+                if (ok) return JSON.stringify({status: res.status, body: text, header: hdr, tokLen: tok.length, ok: true, tokSrc: c.src});
                 if (res.status !== 403 || !/csrf/i.test(text)) {
-                    return JSON.stringify({status: res.status, body: text, header: hdr, tokLen: tok.length, ok: false, final: true});
+                    return JSON.stringify({status: res.status, body: text, header: hdr, tokLen: tok.length, ok: false, final: true, tokSrc: c.src});
                 }
             }
         }
@@ -642,10 +736,12 @@ async (args) => {
             body: 'all csrf attempts failed',
             ok: false,
             attempts: attempts,
-            candidates: candidates.length,
+            candidates: uniq.length,
+            candSummary: candSummary,
             cookie_readable: document.cookie ? 'yes' : 'no',
             lastTokHdr: lastTokHdr,
             lastTokPrefix: lastTokPrefix,
+            lastTokSrc: lastTokSrc,
             lastStatus: lastStatus,
             lastRespBody: lastRespBody,
         });
@@ -660,22 +756,26 @@ async (args) => {
             result = page.evaluate(js_fn, args_obj)
             data = _json.loads(result)
             if data.get("status") == -1:
-                # 详细日志: 报告最后尝试的 header / token 前缀 / 响应体
                 log.info("  fetch /api/server/renew body=%s -> HTTP -1 resp=%s",
                          body, str(data.get("body", ""))[:200])
-                log.info("    [DIAG] attempts=%s candidates=%s cookie_readable=%s lastTokHdr=%s lastTokPrefix=%r lastStatus=%s lastRespBody=%s",
+                log.info("    [DIAG] attempts=%s candidates=%s cookie_readable=%s candSummary=%s",
                          data.get("attempts"), data.get("candidates"), data.get("cookie_readable"),
+                         data.get("candSummary"))
+                log.info("    [DIAG] lastTokHdr=%s lastTokPrefix=%r lastTokSrc=%s lastStatus=%s lastRespBody=%s",
                          data.get("lastTokHdr"), data.get("lastTokPrefix"),
-                         data.get("lastStatus"), str(data.get("lastRespBody", ""))[:150])
+                         data.get("lastTokSrc"), data.get("lastStatus"),
+                         str(data.get("lastRespBody", ""))[:150])
             else:
-                log.info("  fetch /api/server/renew body=%s -> HTTP %s (header=%s tokLen=%s) resp=%s",
+                tok_src = data.get("tokSrc", "")
+                log.info("  fetch /api/server/renew body=%s -> HTTP %s (header=%s tokLen=%s tokSrc=%s) resp=%s",
                          body, data.get("status"), data.get("header"), data.get("tokLen"),
-                         str(data.get("body", ""))[:200])
+                         tok_src, str(data.get("body", ""))[:200])
             if data.get("status") in (200, 201, 204, 202):
                 return True, data
             # 非 403 或业务错误: 说明 CSRF 已通过, 继续试其他 body 无意义
             if data.get("final") or (data.get("status") not in (403, -1, 0)):
-                log.warning("  CSRF 已通过但业务失败(status=%s), 停止尝试", data.get("status"))
+                log.warning("  CSRF 已通过但业务失败(status=%s tokSrc=%s), 停止尝试",
+                             data.get("status"), data.get("tokSrc"))
                 break
         except Exception as e:
             log.warning("  fetch attempt failed: %s", e)
@@ -812,6 +912,51 @@ def phase_browser_renewal(cookies=None):
         except Exception as e:
             log.warning("读取浏览器 cookie 失败: %s", e)
 
+        # v3 关键改进: 在浏览器上注册 request/response 监听, 捕获页面自身 JS 发的
+        # /api/server/renew 请求. 这样:
+        #   1) 如果页面 Renew 按钮 click 触发了实际的 renew 请求, 我们能捕获它用的
+        #      header (包括正确的 X-XSRF-TOKEN 来源), 用来诊断我们的 fetch 哪里错
+        #   2) 如果请求成功, 我们直接从响应判断是否续期成功, 无需 query_renewal_field
+        captured_renew_requests = []
+        captured_renew_responses = []
+        try:
+            def _on_request(req):
+                try:
+                    if "/api/server/renew" in req.url and req.method == "POST":
+                        captured_renew_requests.append({
+                            "url": req.url,
+                            "method": req.method,
+                            "headers": dict(req.headers),
+                            "post_data": req.post_data,
+                        })
+                        log.info("📡 [INTERCEPT] 页面发了 renew 请求: %s %s headers=%s post_data=%s",
+                                 req.method, req.url, list(req.headers.keys()),
+                                 (req.post_data or "")[:200])
+                except Exception:
+                    pass
+            def _on_response(resp):
+                try:
+                    if "/api/server/renew" in resp.url and resp.request.method == "POST":
+                        try:
+                            body = resp.text()
+                        except Exception:
+                            body = "<binary>"
+                        captured_renew_responses.append({
+                            "url": resp.url,
+                            "status": resp.status,
+                            "headers": dict(resp.headers),
+                            "body": body[:500],
+                        })
+                        log.info("📥 [INTERCEPT] renew 响应: HTTP %d body=%s",
+                                 resp.status, body[:200])
+                except Exception:
+                    pass
+            page.on("request", _on_request)
+            page.on("response", _on_response)
+            log.info("🔌 已注册 request/response 监听器 (用于捕获页面自身 renew 请求)")
+        except Exception as e:
+            log.warning("注册 request/response 监听器失败(可忽略): %s", e)
+
         # 访问面板主页
         log.info("导航到 %s ...", DASHBOARD_URL)
         page.goto(DASHBOARD_URL, wait_until="load", timeout=30000)
@@ -891,14 +1036,31 @@ def phase_browser_renewal(cookies=None):
                 page.wait_for_timeout(3000)
                 snap(page, "03_after_renew.png")
                 # 处理 Turnstile 安全验证 (Zampto 续期需要人机验证)
-                # 新版 solve_turnstile: 先等 12s 自动通过, 未通过则坐标点击 iframe checkbox
-                turnstile_ok = solve_turnstile(page, max_wait=60, click_after=12)
+                # v3 solve_turnstile: 先等 8s 自动通过, 失败后多次坐标点击 iframe checkbox (不同 offset)
+                turnstile_ok = solve_turnstile(page, max_wait=90, click_after=8)
                 if not turnstile_ok:
-                    log.warning("Turnstile 60s 内未通过 (已尝试坐标点击), 继续验证 renewal 变化...")
+                    log.warning("Turnstile 90s 内未通过 (已尝试多次坐标点击), 继续验证 renewal 变化...")
                 page.wait_for_timeout(3000)
                 snap(page, "04_after_verify.png")
                 log.info("按钮点击完成, 等待 3s 后验证续期结果...")
                 page.wait_for_timeout(3000)
+
+                # v3 关键改进: 优先用拦截器捕获的 renew 响应判断结果 (最可靠)
+                # 1) 页面自身 JS 发的 renew 请求结果 (有则最权威, 直接看 status + body)
+                if captured_renew_responses:
+                    log.info("📥 拦截到 %d 个 renew 响应, 详情:", len(captured_renew_responses))
+                    for i, r in enumerate(captured_renew_responses):
+                        log.info("  [%d] HTTP %s body=%s", i, r["status"], r["body"][:200])
+                    # 任一 200/201/204 = 续期成功
+                    if any(r["status"] in (200, 201, 204, 202) for r in captured_renew_responses):
+                        # 打印页面 JS 用的 headers, 帮我下次复现正确路径
+                        for i, req in enumerate(captured_renew_requests):
+                            log.info("  [REQ %d] url=%s headers=%s post_data=%s",
+                                     i, req["url"], req["headers"], req["post_data"])
+                        browser.close()
+                        log.info("✅ 续期成功 (页面 JS 触发的 renew 请求成功)")
+                        return "renewed"
+
                 # 验证续期是否真的生效: 重新查询 renewal, 与点击前对比
                 new_renewal = query_renewal_field(cookies=cookies, page=page)
                 log.info("续期后 renewal: %r (点击前: %r)", new_renewal, baseline_renewal)

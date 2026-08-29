@@ -244,6 +244,16 @@ jobs:
       - name: 📸 上传截图
         if: always()
         uses: actions/upload-artifact@v4
+        env:
+          # 显式清空代理环境变量给 upload-artifact@v4 用 (Node undici 解析代理 URL,
+          # socks5h:// 它不支持会抛 "Invalid URL protocol" 错误).
+          # 注意: GitHub Actions env key 不区分大小写 (case-insensitive),
+          # 不能同时写 ALL_PROXY 和 all_proxy 否则会被拒 "X is already defined".
+          # 这里只保留大写形式 + NO_PROXY, 全部置空让 Node 不使用任何代理.
+          ALL_PROXY: ''
+          HTTP_PROXY: ''
+          HTTPS_PROXY: ''
+          NO_PROXY: '*'
         with:
           name: debug-${{ github.run_number }}
           path: |
